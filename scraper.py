@@ -14,8 +14,11 @@ from bs4 import BeautifulSoup
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+DOCS_DIR = BASE_DIR / "docs"
+DOCS_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_jobs.json"
 RESULTS_FILE = DATA_DIR / "results.html"
+PUBLIC_FILE = DOCS_DIR / "index.html"
 LOG_FILE = DATA_DIR / "scraper.log"
 
 HEADERS = {
@@ -49,6 +52,30 @@ KEYWORDS = [
     "maison d'édition",
     "traducteur",
     "traductrice",
+    # Terminologie suisse (ge.ch, école de commerce, etc.)
+    "maître d'enseignement général / français",
+    "maître d'enseignement général - français",
+    "maître d'enseignement général – français",
+    "maîtresse d'enseignement général / français",
+    "maîtresse d'enseignement général - français",
+    "maîtresse d'enseignement général – français",
+    "français langue étrangère",
+    "français cdd",
+    "expression orale",
+    "diction",
+    "culture générale",
+]
+
+# Termes désignant un enseignant (ge.ch, jura.ch, etc. utilisent des conventions différentes)
+TEACHING_TERMS = [
+    "enseignement", "enseignant", "enseignante",
+    "maître", "maîtresse", "professeur", "professeure",
+]
+
+# Matières liées aux Lettres Modernes
+LETTRES_SUBJECTS = [
+    "français", "lettres", "littérature", "expression orale",
+    "diction", "français langue étrangère", "culture générale",
 ]
 
 EXCLUDE_KEYWORDS = [
@@ -68,6 +95,17 @@ SEARCH_TERMS = [
     "traducteur",
     "communication",
 ]
+
+# Communes et lieux du district de Nyon (Vaud) acceptables pour le zone Genève–Gland
+VAUD_ZONE = {
+    "nyon", "gland", "coppet", "prangins", "rolle",
+    "mies", "tannay", "commugny", "founex", "bogis",
+    "chavannes-de-bogis", "chavannes-des-bois", "borex",
+    "eysins", "signy", "genolier", "gingins", "givrins",
+    "arzier", "saint-cergue", "coinsins", "vich", "grens",
+    "dully", "luins", "gilly", "tartegnin", "perroy",
+    "allaman", "aubonne",
+}
 
 
 def log(msg: str):
@@ -99,7 +137,12 @@ def is_relevant(title: str, description: str = "") -> bool:
     text = (title + " " + description).lower()
     if any(k.lower() in text for k in EXCLUDE_KEYWORDS):
         return False
-    return any(k.lower() in text for k in KEYWORDS)
+    if any(k.lower() in text for k in KEYWORDS):
+        return True
+    # Détecte "Enseignant de français", "Maître d'enseignement / Français", etc.
+    if any(t in text for t in TEACHING_TERMS) and any(s in text for s in LETTRES_SUBJECTS):
+        return True
+    return False
 
 
 def fetch(url: str, retries: int = 3):
@@ -114,150 +157,110 @@ def fetch(url: str, retries: int = 3):
     return None
 
 
-def extract_next_data(soup) -> dict:
-    """Extrait le JSON embarqué dans les pages Next.js (__NEXT_DATA__)."""
-    tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if tag and tag.string:
-        try:
-            return json.loads(tag.string)
-        except json.JSONDecodeError:
-            pass
-    return {}
-
-
 # ---------------------------------------------------------------------------
 # Scrapers
 # ---------------------------------------------------------------------------
 
-def scrape_jobup() -> list:
-    """JobUp.ch — SPA Next.js avec JSON embarqué."""
+def scrape_jura() -> list:
+    """Offres du Canton du Jura — enseignement et administration.
+
+    La page Jura liste les offres dans des <table> (titre en texte brut)
+    et fournit un lien PDF séparé pour chaque offre via <a href="...Htdocs...">
+    Le lien PDF a le même texte que le titre de l'offre.
+    """
+    import re as _re
+
     jobs = []
-    for term in SEARCH_TERMS:
-        url = (
-            f"https://www.jobup.ch/fr/emplois/"
-            f"?term={requests.utils.quote(term)}&location=Gen%C3%A8ve&publication-date=7"
-        )
-        soup = fetch(url)
+    pages = [
+        (
+            "https://www.jura.ch/fr/Autorites/Administration/DFI/SRH/"
+            "Offres-d-emploi/Offres-d-emploi-Enseignement.html",
+            "jura.ch (enseignement)",
+        ),
+        (
+            "https://www.jura.ch/fr/Autorites/Administration/DFI/SRH/"
+            "Offres-d-emploi-Administration/Offres-d-emploi-Administration.html",
+            "jura.ch (administration)",
+        ),
+        (
+            "https://www.jura.ch/fr/Autorites/Administration/DFI/SRH/"
+            "Offres-d-emploi/Offres-d-emploi-Autres.html",
+            "jura.ch (autres)",
+        ),
+    ]
+
+    for page_url, source_label in pages:
+        soup = fetch(page_url)
         if not soup:
             continue
 
-        data = extract_next_data(soup)
-        try:
-            # La structure varie ; on cherche la liste de vacances
-            vacancies = (
-                data.get("props", {})
-                    .get("pageProps", {})
-                    .get("searchResult", {})
-                    .get("vacancies", [])
-            )
-        except (AttributeError, KeyError):
-            vacancies = []
-
-        for v in vacancies:
-            title = v.get("title", "")
-            company = v.get("company", {}).get("name", "—") if isinstance(v.get("company"), dict) else "—"
-            slug = v.get("slug") or v.get("id", "")
-            href = f"https://www.jobup.ch/fr/emplois/detail/{slug}/" if slug else ""
-            if title and href and is_relevant(title):
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "url": href,
-                    "source": "JobUp.ch",
-                    "found_at": datetime.now().isoformat(),
-                })
-        time.sleep(1.5)
-
-    log(f"JobUp.ch: {len(jobs)} offre(s) trouvée(s)")
-    return jobs
-
-
-def scrape_jobs_ch() -> list:
-    """Jobs.ch — SPA Next.js avec JSON embarqué."""
-    jobs = []
-    for term in SEARCH_TERMS:
-        url = (
-            f"https://www.jobs.ch/fr/jobs/"
-            f"?term={requests.utils.quote(term)}&location=Gen%C3%A8ve"
-        )
-        soup = fetch(url)
-        if not soup:
-            continue
-
-        data = extract_next_data(soup)
-        try:
-            results = (
-                data.get("props", {})
-                    .get("pageProps", {})
-                    .get("jobs", [])
-            )
-            if not results:
-                results = (
-                    data.get("props", {})
-                        .get("pageProps", {})
-                        .get("searchResults", {})
-                        .get("items", [])
-                )
-        except (AttributeError, KeyError):
-            results = []
-
-        for item in results:
-            title = item.get("title", "") or item.get("name", "")
-            company = item.get("company", {}).get("name", "—") if isinstance(item.get("company"), dict) else "—"
-            slug = item.get("slug") or item.get("id", "")
-            href = f"https://www.jobs.ch/fr/jobs/{slug}/" if slug else ""
-            if title and href and is_relevant(title):
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "url": href,
-                    "source": "Jobs.ch",
-                    "found_at": datetime.now().isoformat(),
-                })
-        time.sleep(1.5)
-
-    log(f"Jobs.ch: {len(jobs)} offre(s) trouvée(s)")
-    return jobs
-
-
-def scrape_jobscout24() -> list:
-    """JobScout24.ch — HTML traditionnel."""
-    jobs = []
-    for term in SEARCH_TERMS:
-        url = (
-            f"https://www.jobscout24.ch/fr/jobs"
-            f"?query={requests.utils.quote(term)}&location=Gen%C3%A8ve"
-        )
-        soup = fetch(url)
-        if not soup:
-            continue
-
-        for li in soup.select("li.job-list-item"):
-            title_el = li.select_one("a.job-title, a.job-link-detail")
-            if not title_el:
+        # Les liens PDF ont href contenant "/Htdocs/" et le texte = titre de l'offre
+        found_on_page = 0
+        for a in soup.select("a[href*='/Htdocs/']"):
+            href = a["href"]
+            if not href.startswith("http"):
+                href = "https://www.jura.ch" + href
+            # Nettoyer le titre : supprimer "(PDF, X Ko)" à la fin
+            raw_title = a.get_text(strip=True)
+            title = _re.sub(r"\s*\(PDF[^)]*\)\s*$", "", raw_title).strip()
+            if not title:
                 continue
-            title = title_el.get_text(strip=True)
-            detail_url = li.get("data-job-detail-url", "")
-            if not detail_url:
-                a = li.select_one("a[href]")
-                detail_url = a["href"] if a else ""
-            if detail_url and not detail_url.startswith("http"):
-                detail_url = "https://www.jobscout24.ch" + detail_url
-            # company is in first <span> inside p.job-attributes
-            spans = li.select("p.job-attributes span")
-            company = spans[0].get_text(strip=True) if spans else "—"
-            if title and detail_url and is_relevant(title):
+            if is_relevant(title):
                 jobs.append({
                     "title": title,
-                    "company": company,
-                    "url": detail_url,
-                    "source": "JobScout24.ch",
+                    "company": "Canton du Jura",
+                    "url": href,
+                    "source": source_label,
                     "found_at": datetime.now().isoformat(),
                 })
-        time.sleep(1.5)
+                found_on_page += 1
 
-    log(f"JobScout24.ch: {len(jobs)} offre(s) trouvée(s)")
+        time.sleep(1)
+        log(f"{source_label}: {found_on_page} offre(s) trouvée(s)")
+
     return jobs
+
+
+def scrape_ville_geneve() -> list:
+    """Offres de la Ville de Genève (administration municipale)."""
+    jobs = []
+    url = (
+        "https://www.ville-geneve.ch/autorites-administration/"
+        "administration-municipale/travailler-ville-geneve/offres-emploi/"
+    )
+    soup = fetch(url)
+    if not soup:
+        return jobs
+
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if "/administration-municipale/offres-emploi/" not in href:
+            continue
+        title = a.get_text(strip=True)
+        if not title or len(title) < 5:
+            continue
+        if not href.startswith("http"):
+            href = "https://www.ville-geneve.ch" + href
+        if is_relevant(title):
+            jobs.append({
+                "title": title,
+                "company": "Ville de Genève",
+                "url": href,
+                "source": "ville-geneve.ch",
+                "location": "Genève",
+                "found_at": datetime.now().isoformat(),
+            })
+
+    # Dédoublonner par URL (même lien peut apparaître deux fois dans la page)
+    seen_urls = set()
+    unique = []
+    for j in jobs:
+        if j["url"] not in seen_urls:
+            seen_urls.add(j["url"])
+            unique.append(j)
+
+    log(f"ville-geneve.ch: {len(unique)} offre(s) trouvée(s)")
+    return unique
 
 
 def scrape_letemps() -> list:
@@ -284,10 +287,281 @@ def scrape_letemps() -> list:
                 "company": company,
                 "url": href,
                 "source": "Le Temps Emploi",
+                "location": "—",
                 "found_at": datetime.now().isoformat(),
             })
 
     log(f"Le Temps Emploi: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_vaud() -> list:
+    """Offres de l'État de Vaud via Oracle HCM REST API.
+
+    Le portail offres-emploi.vd.ch délègue à Oracle Cloud HCM.
+    L'API REST est publiquement accessible et retourne du JSON.
+    """
+    jobs = []
+    oracle_base = "https://fa-ewrg-saasfaeuraprod1.fa.ocs.oraclecloud.com"
+    api_url = (
+        f"{oracle_base}/hcmRestApi/resources/11.13.18.05/"
+        "recruitingCEJobRequisitions"
+        "?expand=requisitionList"
+        "&finder=findReqs;siteNumber=CX_2,limit=500"
+    )
+    headers_oracle = {
+        **HEADERS,
+        "Accept": "application/json",
+        "ora-irc-vanity-domain": "Y",
+    }
+    try:
+        r = requests.get(api_url, headers=headers_oracle, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        reqs = data.get("items", [{}])[0].get("requisitionList", [])
+        found = 0
+        for job in reqs:
+            title = job.get("Title", "").strip()
+            jid = job.get("Id")
+            if not title or not jid:
+                continue
+            short_desc = job.get("ShortDescriptionStr") or ""
+            loc = job.get("PrimaryLocation", "")
+            if not any(z in loc.lower() for z in VAUD_ZONE):
+                continue
+            if is_relevant(title, short_desc):
+                url = f"https://offres-emploi.vd.ch/#fr/job/{jid}"
+                jobs.append({
+                    "title": title,
+                    "company": "État de Vaud",
+                    "url": url,
+                    "source": "offres-emploi.vd.ch",
+                    "location": loc,
+                    "found_at": datetime.now().isoformat(),
+                })
+                found += 1
+        log(f"offres-emploi.vd.ch: {found} offre(s) trouvée(s) sur {len(reqs)} total")
+    except Exception as e:
+        log(f"Erreur scrape_vaud: {e}")
+    return jobs
+
+
+def scrape_fribourg() -> list:
+    """Offres de l'État de Fribourg via jobs.fr.ch.
+
+    La page de recherche retourne des div.job avec un lien dont le texte
+    est le titre du poste et le href est le chemin relatif vers l'offre.
+    """
+    jobs = []
+    url = "https://jobs.fr.ch/search/?createNewAlert=false&q=&locationsearch=&optionsFacets"
+    soup = fetch(url)
+    if not soup:
+        return jobs
+
+    found = 0
+    seen_urls: set = set()
+    for div in soup.select("div.job"):
+        # Le premier lien dans le div porte le titre du poste
+        link = div.select_one("a[href]")
+        if not link:
+            continue
+        title = link.get_text(strip=True)
+        href = link.get("href", "")
+        if not title or not href:
+            continue
+        full_url = "https://jobs.fr.ch" + href if href.startswith("/") else href
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
+        if is_relevant(title):
+            jobs.append({
+                "title": title,
+                "company": "État de Fribourg",
+                "url": full_url,
+                "source": "jobs.fr.ch",
+                "found_at": datetime.now().isoformat(),
+            })
+            found += 1
+
+    log(f"jobs.fr.ch (Fribourg): {found} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_lausanne() -> list:
+    """Offres de la Ville de Lausanne via Oracle HCM REST API (siteNumber=CX_1, même tenant que Vaud)."""
+    jobs = []
+    oracle_base = "https://fa-ewrg-saasfaeuraprod1.fa.ocs.oraclecloud.com"
+    api_url = (
+        f"{oracle_base}/hcmRestApi/resources/11.13.18.05/"
+        "recruitingCEJobRequisitions"
+        "?expand=requisitionList"
+        "&finder=findReqs;siteNumber=CX_1,limit=500"
+    )
+    headers_oracle = {
+        **HEADERS,
+        "Accept": "application/json",
+        "ora-irc-vanity-domain": "Y",
+    }
+    try:
+        r = requests.get(api_url, headers=headers_oracle, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        reqs = data.get("items", [{}])[0].get("requisitionList", [])
+        found = 0
+        for job in reqs:
+            title = job.get("Title", "").strip()
+            jid = job.get("Id")
+            if not title or not jid:
+                continue
+            short_desc = job.get("ShortDescriptionStr") or ""
+            if is_relevant(title, short_desc):
+                url = (
+                    "https://www.lausanne.ch/officiel/travailler-a-la-ville/"
+                    f"nous-rejoindre/offres-emploi/detail-offre-emploi.html?id={jid}"
+                )
+                jobs.append({
+                    "title": title,
+                    "company": "Ville de Lausanne",
+                    "url": url,
+                    "source": "offres-emploi.lausanne.ch",
+                    "found_at": datetime.now().isoformat(),
+                })
+                found += 1
+        log(f"offres-emploi.lausanne.ch: {found} offre(s) trouvée(s) sur {len(reqs)} total")
+    except Exception as e:
+        log(f"Erreur scrape_lausanne: {e}")
+    return jobs
+
+
+def scrape_bcu_lausanne() -> list:
+    """Offres de la Bibliothèque Cantonale et Universitaire de Lausanne (WordPress)."""
+    jobs = []
+    url = "https://www.bcu-lausanne.ch/emplois/"
+    soup = fetch(url)
+    if not soup:
+        return jobs
+
+    found = 0
+    for article in soup.select("article.job-item"):
+        title_el = article.select_one("h2 a, h3 a")
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        href = title_el.get("href", "")
+        if not title or not href:
+            continue
+        if is_relevant(title):
+            jobs.append({
+                "title": title,
+                "company": "BCU Lausanne",
+                "url": href,
+                "source": "bcu-lausanne.ch",
+                "found_at": datetime.now().isoformat(),
+            })
+            found += 1
+
+    log(f"bcu-lausanne.ch: {found} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_jobscout24() -> list:
+    """Offres privées via JobScout24.ch (secteur privé, éditeurs, bibliothèques…).
+
+    Cherche plusieurs termes-clés dans la région de Genève (GE) et le district
+    de Nyon (VD), afin de capturer les employeurs privés comme les maisons d'édition.
+    """
+    # Termes de recherche pertinents pour Lettres Modernes (slugs URL JobScout24)
+    KEYWORDS_JS24 = [
+        "redacteur",
+        "editeur",
+        "bibliothecaire",
+        "libraire",
+        "correcteur",
+        "traducteur",
+        "documentaliste",
+        "journaliste",
+        "communication",
+        "edition",
+        "professeur-francais",
+        "enseignant",
+        "mediateur-culturel",
+        "charge-de-communication",
+        "archiviste",
+    ]
+
+    # Localisations acceptées pour les résultats VD (district de Nyon)
+    VAUD_ZONE_LOWER = VAUD_ZONE  # already lowercase strings
+
+    # Communes du canton de Genève (pour filtrage secondaire si nécessaire)
+    GENEVE_ZONE = {
+        "genève", "geneva", "carouge", "lancy", "meyrin", "vernier", "onex",
+        "plan-les-ouates", "thônex", "bernex", "chêne-bougeries", "chêne-bourg",
+        "pregny-chambésy", "grand-saconnex", "satigny", "dardagny", "russin",
+        "avully", "avusy", "cartigny", "chancy", "laconnex", "soral", "gy",
+        "jussy", "choulex", "cologny", "vandoeuvres", "puplinge", "presinge",
+        "meinier", "collonge-bellerive", "hermance", "anières", "corsier",
+        "céligny", "bellevue", "genthod", "versoix", "collex-bossy",
+    }
+
+    BASE = "https://www.jobscout24.ch"
+    jobs = []
+    seen_urls: set = set()
+    total_found = 0
+
+    search_configs = [
+        ("GE", GENEVE_ZONE),      # Canton Genève → communes du canton
+        ("VD", VAUD_ZONE_LOWER),  # Vaud → seulement district Nyon
+    ]
+
+    for kw in KEYWORDS_JS24:
+        for region_code, zone_filter in search_configs:
+            url = f"{BASE}/fr/jobs/{kw}/?region={region_code}"
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=15)
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "lxml")
+                items = soup.select("li.job-list-item")
+                for item in items:
+                    title_el = item.select_one("a.job-link-detail")
+                    if not title_el:
+                        continue
+                    title = title_el.get_text(strip=True)
+                    href = title_el.get("href", "")
+                    if not href:
+                        continue
+                    full_url = BASE + href if href.startswith("/") else href
+                    if full_url in seen_urls:
+                        continue
+
+                    spans = item.select("p.job-attributes span")
+                    company = spans[0].get_text(strip=True) if len(spans) > 0 else "—"
+                    location = spans[1].get_text(strip=True) if len(spans) > 1 else "—"
+                    loc_lower = location.lower()
+
+                    # Filtre géographique pour Vaud
+                    if zone_filter is not None:
+                        if not any(z in loc_lower for z in zone_filter):
+                            continue
+
+                    if not is_relevant(title):
+                        continue
+
+                    seen_urls.add(full_url)
+                    jobs.append({
+                        "title": title,
+                        "company": company,
+                        "url": full_url,
+                        "source": "jobscout24.ch",
+                        "location": location if location else "—",
+                        "found_at": datetime.now().isoformat(),
+                    })
+                    total_found += 1
+            except Exception as e:
+                log(f"Erreur jobscout24 [{kw}/{region_code}]: {e}")
+            time.sleep(0.5)
+
+    log(f"jobscout24.ch: {total_found} offre(s) trouvée(s)")
     return jobs
 
 
@@ -317,6 +591,7 @@ def scrape_ge_ch() -> list:
                 "company": "État de Genève",
                 "url": href,
                 "source": "ge.ch",
+                "location": "Genève",
                 "found_at": datetime.now().isoformat(),
             })
 
@@ -338,6 +613,7 @@ def generate_html(new_jobs: list, all_jobs: list):
                 f'<tr class="{css_class}">'
                 f'<td><a href="{j["url"]}" target="_blank">{j["title"]}</a></td>'
                 f'<td>{j["company"]}</td>'
+                f'<td>{j.get("location", "—")}</td>'
                 f'<td>{j["source"]}</td>'
                 f'<td>{j["found_at"][:16].replace("T", " ")}</td>'
                 f'</tr>\n'
@@ -349,7 +625,7 @@ def generate_html(new_jobs: list, all_jobs: list):
         if not new_jobs
         else (
             f'<table><thead><tr><th>Poste</th><th>Entreprise</th>'
-            f'<th>Source</th><th>Trouvé le</th></tr></thead>'
+            f'<th>Lieu</th><th>Source</th><th>Trouvé le</th></tr></thead>'
             f'<tbody>{rows(new_jobs, "new")}</tbody></table>'
         )
     )
@@ -360,7 +636,7 @@ def generate_html(new_jobs: list, all_jobs: list):
         if not all_jobs
         else (
             f'<table><thead><tr><th>Poste</th><th>Entreprise</th>'
-            f'<th>Source</th><th>Trouvé le</th></tr></thead>'
+            f'<th>Lieu</th><th>Source</th><th>Trouvé le</th></tr></thead>'
             f'<tbody>{rows(sorted_all)}</tbody></table>'
         )
     )
@@ -400,6 +676,8 @@ def generate_html(new_jobs: list, all_jobs: list):
 
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
         f.write(html)
+    with open(PUBLIC_FILE, "w", encoding="utf-8") as f:
+        f.write(html)
     log(f"Rapport HTML mis à jour : {RESULTS_FILE}")
 
 
@@ -427,10 +705,11 @@ def main():
     all_jobs = load_all_jobs()
 
     raw = []
-    # JobUp.ch et Jobs.ch sont protégés par AWS WAF (captcha) — ignorés
-    raw.extend(scrape_jobscout24())
+    raw.extend(scrape_ville_geneve())
     raw.extend(scrape_letemps())
     raw.extend(scrape_ge_ch())
+    raw.extend(scrape_vaud())
+    raw.extend(scrape_jobscout24())
 
     new_jobs = []
     for job in raw:
