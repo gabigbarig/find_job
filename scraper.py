@@ -565,6 +565,188 @@ def scrape_jobscout24() -> list:
     return jobs
 
 
+def scrape_jobup() -> list:
+    """Offres secteur privé via jobup.ch (leader romand de l'emploi).
+
+    La page de résultats est server-side rendered — pas besoin de JS.
+    Recherche avec region=34 (canton de Genève) et location=nyon pour Nyon/Gland.
+    """
+    import urllib.parse
+
+    BASE = "https://www.jobup.ch"
+
+    KEYWORDS_JU = [
+        "rédacteur", "éditeur", "bibliothécaire", "libraire",
+        "correcteur", "traducteur", "journaliste", "communication",
+        "documentaliste", "archiviste", "bibliothèque", "édition",
+        "professeur français", "enseignant français",
+    ]
+
+    # Zones géographiques : region=34 (GE) + location=nyon pour district Nyon
+    SEARCH_CONFIGS = [
+        ("region=34", None),           # Canton de Genève
+        ("location=nyon", VAUD_ZONE),  # Nyon et district, filtre VAUD_ZONE
+    ]
+
+    jobs = []
+    seen_urls: set = set()
+    total = 0
+
+    for kw in KEYWORDS_JU:
+        for geo_param, zone_filter in SEARCH_CONFIGS:
+            url = f"{BASE}/fr/emplois/?{geo_param}&term={urllib.parse.quote(kw)}"
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=15)
+                if r.status_code != 200:
+                    continue
+                from bs4 import BeautifulSoup as _BS
+                soup = _BS(r.text, "lxml")
+                cards = soup.select("[data-cy='serp-item']")
+                for card in cards:
+                    link = card.select_one("[data-cy='job-link']")
+                    if not link:
+                        continue
+                    title = link.get("title", "").strip()
+                    href = link.get("href", "")
+                    if not title or not href:
+                        continue
+                    full_url = BASE + href if href.startswith("/") else href
+                    if full_url in seen_urls:
+                        continue
+
+                    # Extraire la localisation du texte de la carte
+                    card_text = card.get_text("\n")
+                    loc = "Genève"
+                    if "Lieu de travail" in card_text:
+                        after = card_text.split("Lieu de travail", 1)[1]
+                        loc_raw = after.strip().lstrip(":").split("\n")[0].strip()
+                        if loc_raw:
+                            loc = loc_raw[:60]
+
+                    # Filtre géographique pour Nyon (Vaud)
+                    if zone_filter is not None:
+                        if not any(z in loc.lower() for z in zone_filter):
+                            continue
+
+                    if not is_relevant(title):
+                        continue
+
+                    seen_urls.add(full_url)
+                    jobs.append({
+                        "title": title,
+                        "company": "—",
+                        "url": full_url,
+                        "source": "jobup.ch",
+                        "location": loc,
+                        "found_at": datetime.now().isoformat(),
+                    })
+                    total += 1
+            except Exception as e:
+                log(f"Erreur jobup [{kw}/{geo_param}]: {e}")
+            time.sleep(0.8)
+
+    log(f"jobup.ch: {total} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_duckduckgo() -> list:
+    """Méta-recherche DuckDuckGo pour attraper des offres hors portails connus.
+
+    DuckDuckGo HTML (pas de JS) agrège des offres depuis tous les sites
+    indexés, y compris les sites d'entreprises avec structured data,
+    les boards de niche, etc. — comme ferait Google.
+    """
+    DDG_URL = "https://html.duckduckgo.com/html/"
+
+    # Requêtes ciblées : terme + zone géographique
+    DDG_QUERIES = [
+        "rédacteur emploi Genève Suisse",
+        "éditeur offre emploi Genève",
+        "bibliothécaire emploi Genève Nyon",
+        "libraire offre emploi Genève CDI",
+        "traducteur emploi Genève Suisse romande",
+        "correcteur offre emploi Suisse romande",
+        "documentaliste emploi Genève",
+        "professeur français emploi Genève école",
+        "chargé communication emploi Genève",
+        "archiviste emploi Genève Suisse",
+    ]
+
+    # Domaines de job boards à exclure (on les scrape déjà directement)
+    ALREADY_COVERED = {"ge.ch", "ville-geneve.ch", "jobscout24.ch", "vd.ch"}
+
+    # Mots indicateurs qu'un résultat est bien une offre d'emploi individuelle
+    JOB_INDICATORS = ["emploi", "job", "offre", "poste", "recrutement",
+                      "career", "vacancy", "emplois", "stellenangebote"]
+
+    GEO_ZONE = {
+        "genève", "geneva", "nyon", "gland", "carouge", "meyrin",
+        "vernier", "lancy", "bernex", "grand-saconnex", "rolle",
+        "coppet", "suisse romande", "suisseromande",
+    }
+
+    jobs = []
+    seen_urls: set = set()
+    total = 0
+
+    for query in DDG_QUERIES:
+        try:
+            r = requests.post(
+                DDG_URL,
+                data={"q": query, "kl": "ch-fr"},
+                headers=HEADERS,
+                timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+            from bs4 import BeautifulSoup as _BS
+            soup = _BS(r.text, "lxml")
+            for res in soup.select(".result__body"):
+                title_el = res.select_one(".result__a")
+                snippet_el = res.select_one(".result__snippet")
+                if not title_el:
+                    continue
+                title = title_el.get_text(strip=True)
+                snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                href = title_el.get("href", "")
+
+                # Exclure les publicités DDG (href contient "ad_domain")
+                if "ad_domain" in href or "ad_provider" in href:
+                    continue
+                # Garder seulement les URLs qui ressemblent à des offres
+                if not any(ind in href.lower() for ind in JOB_INDICATORS):
+                    continue
+                # Exclure les boards déjà couverts
+                if any(d in href for d in ALREADY_COVERED):
+                    continue
+                if href in seen_urls:
+                    continue
+
+                combined = (title + " " + snippet).lower()
+                # Filtre pertinence + zone géographique
+                if not is_relevant(title, snippet):
+                    continue
+                if not any(z in combined for z in GEO_ZONE):
+                    continue
+
+                seen_urls.add(href)
+                jobs.append({
+                    "title": title,
+                    "company": "—",
+                    "url": href,
+                    "source": "DuckDuckGo",
+                    "location": "—",
+                    "found_at": datetime.now().isoformat(),
+                })
+                total += 1
+        except Exception as e:
+            log(f"Erreur DuckDuckGo [{query[:30]}]: {e}")
+        time.sleep(2)
+
+    log(f"DuckDuckGo: {total} offre(s) trouvée(s)")
+    return jobs
+
+
 def scrape_ge_ch() -> list:
     """Offres de l'État de Genève."""
     jobs = []
@@ -710,6 +892,8 @@ def main():
     raw.extend(scrape_ge_ch())
     raw.extend(scrape_vaud())
     raw.extend(scrape_jobscout24())
+    raw.extend(scrape_jobup())
+    raw.extend(scrape_duckduckgo())
 
     new_jobs = []
     for job in raw:
