@@ -11,6 +11,12 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
+# --- Adzuna API (optionnel — agrège Indeed, LinkedIn, etc.) ---
+# Inscription gratuite sur https://developer.adzuna.com/
+# Remplacer les deux valeurs ci-dessous par tes vraies clés.
+ADZUNA_ID  = ""   # ex: "a1b2c3d4"
+ADZUNA_KEY = ""   # ex: "e5f6g7h8i9j0k1l2"
+
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -747,6 +753,68 @@ def scrape_duckduckgo() -> list:
     return jobs
 
 
+def scrape_adzuna() -> list:
+    """Offres via l'API Adzuna — agrège Indeed, LinkedIn, JobScout, et +200 boards.
+
+    Nécessite des clés gratuites : https://developer.adzuna.com/
+    Si ADZUNA_ID est vide, le scraper est silencieusement désactivé.
+    """
+    import urllib.parse as _up
+
+    if not ADZUNA_ID or not ADZUNA_KEY:
+        return []
+
+    KEYWORDS_AZ = [
+        "rédacteur", "éditeur", "bibliothécaire", "libraire",
+        "correcteur", "traducteur", "journaliste", "documentaliste",
+        "professeur français", "communication culturelle", "archiviste",
+    ]
+
+    jobs = []
+    seen_urls: set = set()
+    total = 0
+
+    for kw in KEYWORDS_AZ:
+        url = (
+            "https://api.adzuna.com/v1/api/jobs/ch/search/1"
+            f"?app_id={ADZUNA_ID}&app_key={ADZUNA_KEY}"
+            f"&results_per_page=50&what={_up.quote(kw)}"
+            "&where=Geneva&distance=30&max_days_old=30"
+            "&content-type=application/json"
+        )
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                log(f"Adzuna [{kw}]: HTTP {r.status_code}")
+                continue
+            for item in r.json().get("results", []):
+                title = item.get("title", "").strip()
+                link = item.get("redirect_url", "")
+                desc = item.get("description", "")[:300]
+                company = item.get("company", {}).get("display_name", "—")
+                location = item.get("location", {}).get("display_name", "—")
+                if not title or not link or link in seen_urls:
+                    continue
+                if not is_relevant(title, desc):
+                    continue
+                seen_urls.add(link)
+                jobs.append({
+                    "title": title,
+                    "company": company,
+                    "url": link,
+                    "source": "Adzuna (Indeed+)",
+                    "location": location,
+                    "found_at": datetime.now().isoformat(),
+                })
+                total += 1
+        except Exception as e:
+            log(f"Adzuna [{kw}]: {e}")
+        time.sleep(1)
+
+    log(f"Adzuna: {total} offre(s) trouvée(s)")
+    return jobs
+
+
 def scrape_ge_ch() -> list:
     """Offres de l'État de Genève."""
     jobs = []
@@ -894,6 +962,7 @@ def main():
     raw.extend(scrape_jobscout24())
     raw.extend(scrape_jobup())
     raw.extend(scrape_duckduckgo())
+    raw.extend(scrape_adzuna())
 
     new_jobs = []
     for job in raw:
