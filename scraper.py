@@ -14,8 +14,8 @@ from bs4 import BeautifulSoup
 # --- Adzuna API (optionnel — agrège Indeed, LinkedIn, etc.) ---
 # Inscription gratuite sur https://developer.adzuna.com/
 # Remplacer les deux valeurs ci-dessous par tes vraies clés.
-ADZUNA_ID  = ""   # ex: "a1b2c3d4"
-ADZUNA_KEY = ""   # ex: "e5f6g7h8i9j0k1l2"
+ADZUNA_ID  = "e91c32be"
+ADZUNA_KEY = "e649b514710a4094554f36782966fb30"
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -793,11 +793,15 @@ def scrape_adzuna() -> list:
                 desc = item.get("description", "")[:300]
                 company = item.get("company", {}).get("display_name", "—")
                 location = item.get("location", {}).get("display_name", "—")
-                if not title or not link or link in seen_urls:
+                # Dédupliquer par ID Adzuna (path sans query params)
+                import urllib.parse as _up2
+                parsed = _up2.urlparse(link)
+                dedup_key = parsed.path  # /land/ad/5756654131 ou /details/5758314382
+                if not title or not link or dedup_key in seen_urls:
                     continue
                 if not is_relevant(title, desc):
                     continue
-                seen_urls.add(link)
+                seen_urls.add(dedup_key)
                 jobs.append({
                     "title": title,
                     "company": company,
@@ -964,11 +968,16 @@ def main():
     raw.extend(scrape_duckduckgo())
     raw.extend(scrape_adzuna())
 
+    # Clés de déduplication sur le titre seul (détecte les doublons inter-sources)
+    seen_titles = {j["title"].lower().strip() for j in all_jobs}
+
     new_jobs = []
     for job in raw:
         jid = job_id(job["title"], job["url"])
-        if jid not in seen:
+        title_key = job["title"].lower().strip()
+        if jid not in seen and title_key not in seen_titles:
             seen.add(jid)
+            seen_titles.add(title_key)
             new_jobs.append(job)
             all_jobs.append(job)
 
