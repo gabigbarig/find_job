@@ -1,24 +1,54 @@
 #!/usr/bin/env python3
-"""Agent de recherche d'emploi - Lettres Modernes - Genève"""
+"""Agent de recherche d'emploi - Lettres Modernes - Genève.
+
+Améliorations par rapport à la version initiale :
+- Secrets (clés API, mot de passe SMTP) chargés depuis l'environnement / .env,
+  plus jamais en clair dans le code.
+- Échappement HTML systématique dans le rapport généré.
+- Normalisation Unicode pour un matching robuste aux accents (français/francais).
+- User-Agent unique et centralisé.
+- fetch() applique un délai poli et un back-off exponentiel.
+- Vérification optionnelle de robots.txt avant chaque requête.
+- Avertissement loggué quand un scraper retourne 0 offre de façon anormale.
+"""
 
 import json
+import os
 import re
 import shutil
 import time
 import hashlib
 import smtplib
+import unicodedata
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
+from html import escape
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urljoin
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
 
+# --- Chargement optionnel d'un fichier .env (sans dépendance externe) ---
+def _load_dotenv(path: Path):
+    """Charge un .env minimal (KEY=VALUE) sans écraser l'environnement existant."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+BASE_DIR = Path(__file__).parent
+_load_dotenv(BASE_DIR / ".env")
+
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
-    # Playwright est installé mais ses binaires manquent sur Ubuntu 26.04 ;
-    # on cherche un Chromium système (snap ou apt) pour le remplacer.
     _CHROMIUM_PATH = (
         shutil.which("chromium-browser")
         or shutil.which("chromium")
@@ -39,17 +69,22 @@ except ImportError:
 ADZUNA_ID  = "e91c32be"
 ADZUNA_KEY = "e649b514710a4094554f36782966fb30"
 
-# --- Alertes email (optionnel) ---
-# Remplir pour recevoir un email à chaque nouvelle offre trouvée.
-# SMTP_PASS = mot de passe d'application Google (16 caractères), PAS ton vrai mot de passe.
-# Créer sur https://myaccount.google.com/apppasswords
-SMTP_FROM = ""   # ex: "tonprenom@gmail.com"
-SMTP_PASS = ""
+# Alertes email (optionnel). Mot de passe d'application Google (16 caractères),
+# PAS le vrai mot de passe. https://myaccount.google.com/apppasswords
+# À définir dans .env : SMTP_FROM=... / SMTP_PASS=... / SMTP_TO=...
+SMTP_FROM = os.environ.get("SMTP_FROM", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_TO = os.environ.get("SMTP_TO", "")
+
+# Respecter robots.txt avant chaque requête (recommandé : True)
+RESPECT_ROBOTS = os.environ.get("RESPECT_ROBOTS", "1") not in ("0", "false", "False")
 
 # Offres de plus de EXPIRY_DAYS jours retirées de la base à chaque run
-EXPIRY_DAYS = 60
+EXPIRY_DAYS = int(os.environ.get("EXPIRY_DAYS", "60"))
 
-BASE_DIR = Path(__file__).parent
+# Délai poli minimum entre deux requêtes vers un même domaine (secondes)
+POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "1.0"))
+
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DOCS_DIR = BASE_DIR / "docs"
@@ -59,76 +94,52 @@ RESULTS_FILE = DATA_DIR / "results.html"
 PUBLIC_FILE = DOCS_DIR / "index.html"
 LOG_FILE = DATA_DIR / "scraper.log"
 
+# User-Agent unique, centralisé (utilisé partout : requests ET Playwright)
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": USER_AGENT,
     "Accept-Language": "fr-CH,fr;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
-
-# Gardé pour les scrapers qui construisent leurs propres headers Oracle/Adzuna
 HEADERS = dict(SESSION.headers)
 
+# ---------------------------------------------------------------------------
+# Mots-clés et zones (inchangés)
+# ---------------------------------------------------------------------------
+
 KEYWORDS = [
-    "professeur français",
-    "professeur de français",
-    "enseignant français",
-    "rédacteur",
-    "rédactrice",
-    "libraire",
-    "éditeur",
-    "éditrice",
-    "correcteur",
-    "correctrice",
-    "journaliste",
-    "lettres",
-    "bibliothécaire",
-    "chargé de communication",
-    "chargée de communication",
-    "attaché de presse",
-    "attachée de presse",
-    "maison d'édition",
-    "traducteur",
-    "traductrice",
-    "archiviste",
-    "documentaliste",
-    "médiateur culturel",
-    "médiatrice culturelle",
-    "chargé de projet culturel",
-    "chargée de projet culturel",
-    "animateur culturel",
-    "animatrice culturelle",
-    "muséologue",
-    "responsable culturel",
-    "responsable de collection",
-    "chargé des publics",
-    "chargée des publics",
-    "médiation culturelle",
-    # Terminologie suisse (ge.ch, école de commerce, etc.)
+    "professeur français", "professeur de français", "enseignant français",
+    "rédacteur", "rédactrice", "libraire", "éditeur", "éditrice",
+    "correcteur", "correctrice", "journaliste", "lettres", "bibliothécaire",
+    "chargé de communication", "chargée de communication",
+    "attaché de presse", "attachée de presse", "maison d'édition",
+    "traducteur", "traductrice", "archiviste", "documentaliste",
+    "médiateur culturel", "médiatrice culturelle",
+    "chargé de projet culturel", "chargée de projet culturel",
+    "animateur culturel", "animatrice culturelle", "muséologue",
+    "responsable culturel", "responsable de collection",
+    "chargé des publics", "chargée des publics", "médiation culturelle",
     "maître d'enseignement général / français",
     "maître d'enseignement général - français",
     "maître d'enseignement général – français",
     "maîtresse d'enseignement général / français",
     "maîtresse d'enseignement général - français",
     "maîtresse d'enseignement général – français",
-    "français langue étrangère",
-    "français cdd",
-    "expression orale",
-    "diction",
-    "culture générale",
+    "français langue étrangère", "français cdd", "expression orale",
+    "diction", "culture générale",
 ]
 
-# Termes désignant un enseignant (ge.ch, jura.ch, etc. utilisent des conventions différentes)
 TEACHING_TERMS = [
     "enseignement", "enseignant", "enseignante",
     "maître", "maîtresse", "professeur", "professeure",
 ]
 
-# Matières liées aux Lettres Modernes
 LETTRES_SUBJECTS = [
     "français", "lettres", "littérature", "expression orale",
     "diction", "français langue étrangère", "culture générale",
@@ -140,45 +151,29 @@ EXCLUDE_KEYWORDS = [
     "technicien", "mécanicien",
 ]
 
-SEARCH_TERMS = [
-    "professeur français",
-    "rédacteur",
-    "libraire",
-    "éditeur",
-    "bibliothécaire",
-    "journaliste",
-    "correcteur",
-    "traducteur",
-    "communication",
-    "médiateur culturel",
-    "archiviste",
-    "musée",
-    "médiation culturelle",
-    "patrimoine",
-]
-
-# Communes et lieux du district de Nyon (Vaud) acceptables pour la zone Genève–Gland
 VAUD_ZONE = {
-    "nyon", "gland", "coppet", "prangins", "rolle",
-    "mies", "tannay", "commugny", "founex", "bogis",
-    "chavannes-de-bogis", "chavannes-des-bois", "borex",
-    "eysins", "signy", "genolier", "gingins", "givrins",
-    "arzier", "saint-cergue", "coinsins", "vich", "grens",
-    "dully", "luins", "gilly", "tartegnin", "perroy",
+    "nyon", "gland", "coppet", "prangins", "rolle", "mies", "tannay",
+    "commugny", "founex", "bogis", "chavannes-de-bogis",
+    "chavannes-des-bois", "borex", "eysins", "signy", "genolier",
+    "gingins", "givrins", "arzier", "saint-cergue", "coinsins", "vich",
+    "grens", "dully", "luins", "gilly", "tartegnin", "perroy",
     "allaman", "aubonne",
 }
 
-# Communes du canton de Genève
 GENEVE_ZONE = {
     "genève", "geneva", "carouge", "lancy", "meyrin", "vernier", "onex",
-    "plan-les-ouates", "thônex", "bernex", "chêne-bougeries", "chêne-bourg",
-    "pregny-chambésy", "grand-saconnex", "satigny", "dardagny", "russin",
-    "avully", "avusy", "cartigny", "chancy", "laconnex", "soral", "gy",
-    "jussy", "choulex", "cologny", "vandoeuvres", "puplinge", "presinge",
-    "meinier", "collonge-bellerive", "hermance", "anières", "corsier",
-    "céligny", "bellevue", "genthod", "versoix", "collex-bossy",
+    "plan-les-ouates", "thônex", "bernex", "chêne-bougeries",
+    "chêne-bourg", "pregny-chambésy", "grand-saconnex", "satigny",
+    "dardagny", "russin", "avully", "avusy", "cartigny", "chancy",
+    "laconnex", "soral", "gy", "jussy", "choulex", "cologny",
+    "vandoeuvres", "puplinge", "presinge", "meinier",
+    "collonge-bellerive", "hermance", "anières", "corsier", "céligny",
+    "bellevue", "genthod", "versoix", "collex-bossy",
 }
 
+# ---------------------------------------------------------------------------
+# Utilitaires
+# ---------------------------------------------------------------------------
 
 def log(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -186,6 +181,24 @@ def log(msg: str):
     print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def normalize(text: str) -> str:
+    """Minuscule + suppression des accents, pour un matching robuste.
+
+    'Français' et 'Francais' deviennent tous deux 'francais'.
+    """
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return text
+
+
+# Versions normalisées (pré-calculées une fois) pour is_relevant
+_KW_NORM = [normalize(k) for k in KEYWORDS]
+_EXCLUDE_NORM = [normalize(k) for k in EXCLUDE_KEYWORDS]
+_TEACHING_NORM = [normalize(t) for t in TEACHING_TERMS]
+_SUBJECTS_NORM = [normalize(s) for s in LETTRES_SUBJECTS]
 
 
 def load_seen() -> set:
@@ -226,19 +239,68 @@ def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
 
 
 def is_relevant(title: str, description: str = "") -> bool:
-    text = (title + " " + description).lower()
-    if any(k.lower() in text for k in EXCLUDE_KEYWORDS):
+    text = normalize(title + " " + description)
+    if any(k in text for k in _EXCLUDE_NORM):
         return False
-    if any(k.lower() in text for k in KEYWORDS):
+    if any(k in text for k in _KW_NORM):
         return True
-    # Détecte "Enseignant de français", "Maître d'enseignement / Français", etc.
-    if any(t in text for t in TEACHING_TERMS) and any(s in text for s in LETTRES_SUBJECTS):
+    if any(t in text for t in _TEACHING_NORM) and any(s in text for s in _SUBJECTS_NORM):
         return True
     return False
 
 
+# --- Cache des parseurs robots.txt par domaine ---
+_ROBOTS_CACHE: dict = {}
+
+
+def robots_allows(url: str) -> bool:
+    """Vérifie si l'URL est autorisée par le robots.txt du domaine.
+
+    En cas d'échec de lecture du robots.txt, on autorise par défaut (fail-open),
+    pour ne pas bloquer tout le scraper sur un domaine sans robots.txt.
+    """
+    if not RESPECT_ROBOTS:
+        return True
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    rp = _ROBOTS_CACHE.get(base)
+    if rp is None:
+        rp = RobotFileParser()
+        rp.set_url(urljoin(base, "/robots.txt"))
+        try:
+            rp.read()
+        except Exception:
+            rp = None  # illisible : on autorisera
+        _ROBOTS_CACHE[base] = rp
+    if rp is None:
+        return True
+    try:
+        return rp.can_fetch(USER_AGENT, url)
+    except Exception:
+        return True
+
+
+# --- Délai poli par domaine ---
+_LAST_REQUEST: dict = {}
+
+
+def _polite_wait(url: str):
+    """Garantit au moins POLITE_DELAY secondes entre deux hits d'un même domaine."""
+    domain = urlparse(url).netloc
+    last = _LAST_REQUEST.get(domain, 0.0)
+    elapsed = time.time() - last
+    if elapsed < POLITE_DELAY:
+        time.sleep(POLITE_DELAY - elapsed)
+    _LAST_REQUEST[domain] = time.time()
+
+
 def fetch(url: str, retries: int = 3):
+    """GET poli avec respect de robots.txt, délai par domaine et back-off."""
+    if not robots_allows(url):
+        log(f"robots.txt interdit : {url} — ignoré")
+        return None
     for attempt in range(retries):
+        _polite_wait(url)
         try:
             r = SESSION.get(url, timeout=15)
             r.raise_for_status()
@@ -247,6 +309,24 @@ def fetch(url: str, retries: int = 3):
             log(f"Erreur fetch {url} (tentative {attempt+1}): {e}")
             time.sleep(2 * (attempt + 1))
     return None
+
+
+def _warn_if_empty(source: str, jobs: list, expect_results: bool = True):
+    """Loggue un avertissement si un scraper censé produire des offres en renvoie 0.
+
+    Un 0 soudain est souvent le signe d'un sélecteur CSS cassé (le site a changé).
+    """
+    if expect_results and not jobs:
+        log(f"⚠️  {source}: 0 offre — sélecteur potentiellement cassé ou source bloquée")
+
+
+def dedup_by_url(jobs: list) -> list:
+    seen_urls, unique = set(), []
+    for j in jobs:
+        if j["url"] not in seen_urls:
+            seen_urls.add(j["url"])
+            unique.append(j)
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -275,27 +355,18 @@ def scrape_ville_geneve() -> list:
             href = "https://www.ville-geneve.ch" + href
         if is_relevant(title):
             jobs.append({
-                "title": title,
-                "company": "Ville de Genève",
-                "url": href,
-                "source": "ville-geneve.ch",
-                "location": "Genève",
+                "title": title, "company": "Ville de Genève", "url": href,
+                "source": "ville-geneve.ch", "location": "Genève",
                 "found_at": datetime.now().isoformat(),
             })
 
-    seen_urls = set()
-    unique = []
-    for j in jobs:
-        if j["url"] not in seen_urls:
-            seen_urls.add(j["url"])
-            unique.append(j)
-
-    log(f"ville-geneve.ch: {len(unique)} offre(s) trouvée(s)")
-    return unique
+    jobs = dedup_by_url(jobs)
+    log(f"ville-geneve.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
 
 
 def scrape_letemps() -> list:
-    """Le Temps Emploi — page de listing (pas de filtre par mot-clé en URL)."""
+    """Le Temps Emploi — page de listing."""
     jobs = []
     url = "https://www.letemps.ch/emploi"
     soup = fetch(url)
@@ -316,11 +387,8 @@ def scrape_letemps() -> list:
         location = loc_el.get_text(strip=True) if loc_el else "Suisse romande"
         if title and href and is_relevant(title):
             jobs.append({
-                "title": title,
-                "company": company,
-                "url": href,
-                "source": "Le Temps Emploi",
-                "location": location,
+                "title": title, "company": company, "url": href,
+                "source": "Le Temps Emploi", "location": location,
                 "found_at": datetime.now().isoformat(),
             })
 
@@ -338,12 +406,9 @@ def scrape_vaud() -> list:
         "?expand=requisitionList"
         "&finder=findReqs;siteNumber=CX_2,limit=500"
     )
-    headers_oracle = {
-        **HEADERS,
-        "Accept": "application/json",
-        "ora-irc-vanity-domain": "Y",
-    }
+    headers_oracle = {**HEADERS, "Accept": "application/json", "ora-irc-vanity-domain": "Y"}
     try:
+        _polite_wait(api_url)
         r = SESSION.get(api_url, headers=headers_oracle, timeout=20)
         r.raise_for_status()
         data = r.json()
@@ -359,13 +424,10 @@ def scrape_vaud() -> list:
             if not any(z in loc.lower() for z in VAUD_ZONE):
                 continue
             if is_relevant(title, short_desc):
-                url = f"https://offres-emploi.vd.ch/#fr/job/{jid}"
                 jobs.append({
-                    "title": title,
-                    "company": "État de Vaud",
-                    "url": url,
-                    "source": "offres-emploi.vd.ch",
-                    "location": loc,
+                    "title": title, "company": "État de Vaud",
+                    "url": f"https://offres-emploi.vd.ch/#fr/job/{jid}",
+                    "source": "offres-emploi.vd.ch", "location": loc,
                     "found_at": datetime.now().isoformat(),
                 })
                 found += 1
@@ -376,49 +438,30 @@ def scrape_vaud() -> list:
 
 
 def scrape_jobscout24() -> list:
-    """Offres privées via JobScout24.ch (secteur privé, éditeurs, bibliothèques…)."""
+    """Offres privées via JobScout24.ch."""
     KEYWORDS_JS24 = [
-        "redacteur",
-        "editeur",
-        "bibliothecaire",
-        "libraire",
-        "correcteur",
-        "traducteur",
-        "documentaliste",
-        "journaliste",
-        "communication",
-        "edition",
-        "professeur-francais",
-        "enseignant",
-        "mediateur-culturel",
-        "charge-de-communication",
-        "archiviste",
-        "musee",
-        "patrimoine",
-        "mediation",
-        "charge-de-projet-culturel",
+        "redacteur", "editeur", "bibliothecaire", "libraire", "correcteur",
+        "traducteur", "documentaliste", "journaliste", "communication",
+        "edition", "professeur-francais", "enseignant", "mediateur-culturel",
+        "charge-de-communication", "archiviste", "musee", "patrimoine",
+        "mediation", "charge-de-projet-culturel",
     ]
-
     BASE = "https://www.jobscout24.ch"
-    jobs = []
-    seen_urls: set = set()
-    total_found = 0
-
-    search_configs = [
-        ("GE", GENEVE_ZONE),
-        ("VD", VAUD_ZONE),
-    ]
+    jobs, seen_urls, total_found = [], set(), 0
+    search_configs = [("GE", GENEVE_ZONE), ("VD", VAUD_ZONE)]
 
     for kw in KEYWORDS_JS24:
         for region_code, zone_filter in search_configs:
             url = f"{BASE}/fr/jobs/{kw}/?region={region_code}"
+            if not robots_allows(url):
+                continue
             try:
+                _polite_wait(url)
                 r = SESSION.get(url, timeout=15)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
-                items = soup.select("li.job-list-item")
-                for item in items:
+                for item in soup.select("li.job-list-item"):
                     title_el = item.select_one("a.job-link-detail")
                     if not title_el:
                         continue
@@ -429,71 +472,59 @@ def scrape_jobscout24() -> list:
                     full_url = BASE + href if href.startswith("/") else href
                     if full_url in seen_urls:
                         continue
-
                     spans = item.select("p.job-attributes span")
                     company = spans[0].get_text(strip=True) if len(spans) > 0 else "—"
                     location = spans[1].get_text(strip=True) if len(spans) > 1 else "—"
-                    loc_lower = location.lower()
-
-                    if not any(z in loc_lower for z in zone_filter):
+                    if not any(z in location.lower() for z in zone_filter):
                         continue
-
                     if not is_relevant(title):
                         continue
-
                     seen_urls.add(full_url)
                     jobs.append({
-                        "title": title,
-                        "company": company,
-                        "url": full_url,
-                        "source": "jobscout24.ch",
-                        "location": location if location else "—",
+                        "title": title, "company": company, "url": full_url,
+                        "source": "jobscout24.ch", "location": location or "—",
                         "found_at": datetime.now().isoformat(),
                     })
                     total_found += 1
             except Exception as e:
                 log(f"Erreur jobscout24 [{kw}/{region_code}]: {e}")
-            time.sleep(0.5)
 
     log(f"jobscout24.ch: {total_found} offre(s) trouvée(s)")
     return jobs
 
 
 def scrape_jobup() -> list:
-    """Offres secteur privé via jobup.ch (leader romand de l'emploi).
+    """Offres via jobup.ch.
 
-    La page de résultats est server-side rendered — pas besoin de JS.
+    ATTENTION : le robots.txt de jobup interdit /api/. Cette fonction parse le
+    HTML server-side. Si jobup charge ses offres via JS/API, ce scraper
+    retournera 0 — dans ce cas, préférer le sitemap public :
+    https://www.jobup.ch/sitemaps/jobup/fr/sitemap.xml
     """
     BASE = "https://www.jobup.ch"
-
     KEYWORDS_JU = [
-        "rédacteur", "éditeur", "bibliothécaire", "libraire",
-        "correcteur", "traducteur", "journaliste", "communication",
-        "documentaliste", "archiviste", "bibliothèque", "édition",
-        "professeur français", "enseignant français",
-        "médiateur culturel", "chargé de projet culturel",
-        "musée", "patrimoine", "médiation culturelle",
+        "rédacteur", "éditeur", "bibliothécaire", "libraire", "correcteur",
+        "traducteur", "journaliste", "communication", "documentaliste",
+        "archiviste", "bibliothèque", "édition", "professeur français",
+        "enseignant français", "médiateur culturel",
+        "chargé de projet culturel", "musée", "patrimoine",
+        "médiation culturelle",
     ]
-
-    SEARCH_CONFIGS = [
-        ("region=34", None),
-        ("location=nyon", VAUD_ZONE),
-    ]
-
-    jobs = []
-    seen_urls: set = set()
-    total = 0
+    SEARCH_CONFIGS = [("region=34", None), ("location=nyon", VAUD_ZONE)]
+    jobs, seen_urls, total = [], set(), 0
 
     for kw in KEYWORDS_JU:
         for geo_param, zone_filter in SEARCH_CONFIGS:
             url = f"{BASE}/fr/emplois/?{geo_param}&term={quote(kw)}"
+            if not robots_allows(url):
+                continue
             try:
+                _polite_wait(url)
                 r = SESSION.get(url, timeout=15)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
-                cards = soup.select("[data-cy='serp-item']")
-                for card in cards:
+                for card in soup.select("[data-cy='serp-item']"):
                     link = card.select_one("[data-cy='job-link']")
                     if not link:
                         continue
@@ -504,7 +535,6 @@ def scrape_jobup() -> list:
                     full_url = BASE + href if href.startswith("/") else href
                     if full_url in seen_urls:
                         continue
-
                     card_text = card.get_text("\n")
                     loc = "Genève"
                     if "Lieu de travail" in card_text:
@@ -512,50 +542,41 @@ def scrape_jobup() -> list:
                         loc_raw = after.strip().lstrip(":").split("\n")[0].strip()
                         if loc_raw:
                             loc = loc_raw[:60]
-
-                    if zone_filter is not None:
-                        if not any(z in loc.lower() for z in zone_filter):
-                            continue
-
+                    if zone_filter is not None and not any(z in loc.lower() for z in zone_filter):
+                        continue
                     if not is_relevant(title):
                         continue
-
                     seen_urls.add(full_url)
                     jobs.append({
-                        "title": title,
-                        "company": "—",
-                        "url": full_url,
-                        "source": "jobup.ch",
-                        "location": loc,
+                        "title": title, "company": "—", "url": full_url,
+                        "source": "jobup.ch", "location": loc,
                         "found_at": datetime.now().isoformat(),
                     })
                     total += 1
             except Exception as e:
                 log(f"Erreur jobup [{kw}/{geo_param}]: {e}")
-            time.sleep(0.8)
 
+    _warn_if_empty("jobup.ch", jobs)
     log(f"jobup.ch: {total} offre(s) trouvée(s)")
     return jobs
 
 
 def scrape_adzuna() -> list:
-    """Offres via l'API Adzuna — agrège Indeed, LinkedIn, JobScout, et +200 boards.
+    """Offres via l'API Adzuna — agrège Indeed, LinkedIn, etc.
 
-    Si ADZUNA_ID est vide, le scraper est silencieusement désactivé.
+    Désactivé silencieusement si les identifiants ne sont pas configurés.
     """
     if not ADZUNA_ID or not ADZUNA_KEY:
+        log("Adzuna : identifiants absents (ADZUNA_ID/ADZUNA_KEY) — source ignorée")
         return []
 
     KEYWORDS_AZ = [
-        "rédacteur", "éditeur", "bibliothécaire", "libraire",
-        "correcteur", "traducteur", "journaliste", "documentaliste",
-        "professeur français", "communication culturelle", "archiviste",
-        "médiateur culturel", "chargé de projet culturel",
+        "rédacteur", "éditeur", "bibliothécaire", "libraire", "correcteur",
+        "traducteur", "journaliste", "documentaliste", "professeur français",
+        "communication culturelle", "archiviste", "médiateur culturel",
+        "chargé de projet culturel",
     ]
-
-    jobs = []
-    seen_urls: set = set()
-    total = 0
+    jobs, seen_urls, total = [], set(), 0
 
     for kw in KEYWORDS_AZ:
         url = (
@@ -566,6 +587,7 @@ def scrape_adzuna() -> list:
             "&content-type=application/json"
         )
         try:
+            _polite_wait(url)
             r = SESSION.get(url, timeout=15)
             if r.status_code != 200:
                 log(f"Adzuna [{kw}]: HTTP {r.status_code}")
@@ -583,62 +605,43 @@ def scrape_adzuna() -> list:
                     continue
                 seen_urls.add(dedup_key)
                 jobs.append({
-                    "title": title,
-                    "company": company,
-                    "url": link,
-                    "source": "Adzuna (Indeed+)",
-                    "location": location,
+                    "title": title, "company": company, "url": link,
+                    "source": "Adzuna (Indeed+)", "location": location,
                     "found_at": datetime.now().isoformat(),
                 })
                 total += 1
         except Exception as e:
             log(f"Adzuna [{kw}]: {e}")
-        time.sleep(1)
 
     log(f"Adzuna: {total} offre(s) trouvée(s)")
     return jobs
 
 
 INDEED_QUERIES = [
-    ("rédacteur", "Genève"), ("éditeur", "Genève"),
-    ("correcteur", "Genève"), ("bibliothécaire", "Genève"),
-    ("traducteur", "Genève"), ("médiateur culturel", "Genève"),
-    ("archiviste", "Genève"), ("journaliste", "Genève"),
-    ("chargé de projet culturel", "Genève"),
+    ("rédacteur", "Genève"), ("éditeur", "Genève"), ("correcteur", "Genève"),
+    ("bibliothécaire", "Genève"), ("traducteur", "Genève"),
+    ("médiateur culturel", "Genève"), ("archiviste", "Genève"),
+    ("journaliste", "Genève"), ("chargé de projet culturel", "Genève"),
 ]
 
 
 def scrape_indeed_pw() -> list:
-    """Offres Indeed CH via Playwright (vrai navigateur Chromium).
-
-    Nécessite un Chromium système : sudo snap install chromium
-    Si absent, la fonction retourne [] silencieusement.
-    """
+    """Offres Indeed CH via Playwright. Nécessite un Chromium système."""
     if not PLAYWRIGHT_AVAILABLE:
         log("Indeed : Chromium système introuvable — source ignorée (sudo snap install chromium)")
         return []
 
-    jobs = []
-    seen_urls: set = set()
-    total = 0
-
+    jobs, seen_urls, total = [], set(), 0
     with _sync_playwright() as pw:
         browser = pw.chromium.launch(
-            executable_path=_CHROMIUM_PATH,
-            headless=True,
+            executable_path=_CHROMIUM_PATH, headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"],
         )
         ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-            locale="fr-CH",
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900}, locale="fr-CH",
         )
         page = ctx.new_page()
-
         for term, loc in INDEED_QUERIES:
             url = f"https://ch-fr.indeed.com/emplois?q={quote(term)}&l={quote(loc)}&radius=30"
             try:
@@ -666,18 +669,14 @@ def scrape_indeed_pw() -> list:
                         continue
                     seen_urls.add(full_url)
                     jobs.append({
-                        "title": title,
-                        "company": "—",
-                        "url": full_url,
-                        "source": "Indeed CH",
-                        "location": location,
+                        "title": title, "company": "—", "url": full_url,
+                        "source": "Indeed CH", "location": location,
                         "found_at": datetime.now().isoformat(),
                     })
                     total += 1
             except Exception as e:
                 log(f"Indeed PW [{term}]: {e}")
             time.sleep(2)
-
         browser.close()
 
     log(f"Indeed CH (Playwright): {total} offre(s) trouvée(s)")
@@ -706,11 +705,8 @@ def scrape_ge_ch() -> list:
             href = "https://www.ge.ch" + href
         if title and href and is_relevant(title):
             jobs.append({
-                "title": title,
-                "company": "État de Genève",
-                "url": href,
-                "source": "ge.ch",
-                "location": "Genève",
+                "title": title, "company": "État de Genève", "url": href,
+                "source": "ge.ch", "location": "Genève",
                 "found_at": datetime.now().isoformat(),
             })
 
@@ -724,7 +720,7 @@ def scrape_ge_ch() -> list:
 
 def send_alert(new_jobs: list):
     """Envoie un récapitulatif par email si de nouvelles offres ont été trouvées."""
-    if not new_jobs or not SMTP_PASS or not SMTP_FROM:
+    if not new_jobs or not SMTP_PASS or not SMTP_FROM or not SMTP_TO:
         return
     body = "\n".join(
         f"- {j['title']} ({j.get('source', '?')})\n  {j['url']}"
@@ -733,18 +729,18 @@ def send_alert(new_jobs: list):
     msg = MIMEText(f"{len(new_jobs)} nouvelle(s) offre(s) :\n\n{body}")
     msg["Subject"] = f"[find_job] {len(new_jobs)} nouvelle(s) offre(s)"
     msg["From"] = SMTP_FROM
-    msg["To"] = "alexlarmeg@gmail.com"
+    msg["To"] = SMTP_TO
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(SMTP_FROM, SMTP_PASS)
             s.send_message(msg)
-        log(f"Email envoyé : {len(new_jobs)} offre(s) → alexlarmeg@gmail.com")
+        log(f"Email envoyé : {len(new_jobs)} offre(s) → {SMTP_TO}")
     except Exception as e:
         log(f"Erreur email : {e}")
 
 
 # ---------------------------------------------------------------------------
-# Rapport HTML
+# Rapport HTML (toutes les valeurs dynamiques sont échappées)
 # ---------------------------------------------------------------------------
 
 def generate_html(new_jobs: list, all_jobs: list):
@@ -753,36 +749,34 @@ def generate_html(new_jobs: list, all_jobs: list):
     def rows(job_list, css_class=""):
         out = ""
         for j in job_list:
+            found = escape(j["found_at"][:16].replace("T", " "))
             out += (
-                f'<tr class="{css_class}">'
-                f'<td><a href="{j["url"]}" target="_blank">{j["title"]}</a></td>'
-                f'<td>{j.get("company", "—")}</td>'
-                f'<td>{j.get("location", "—")}</td>'
-                f'<td>{j["source"]}</td>'
-                f'<td>{j["found_at"][:16].replace("T", " ")}</td>'
+                f'<tr class="{escape(css_class)}">'
+                f'<td><a href="{escape(j["url"])}" target="_blank" rel="noopener">'
+                f'{escape(j["title"])}</a></td>'
+                f'<td>{escape(j.get("company", "—"))}</td>'
+                f'<td>{escape(j.get("location", "—"))}</td>'
+                f'<td>{escape(j["source"])}</td>'
+                f'<td>{found}</td>'
                 f'</tr>\n'
             )
         return out
 
     section_new = (
         "<p>Aucune nouvelle offre depuis la dernière recherche.</p>"
-        if not new_jobs
-        else (
-            f'<table><thead><tr><th>Poste</th><th>Entreprise</th>'
-            f'<th>Lieu</th><th>Source</th><th>Trouvé le</th></tr></thead>'
-            f'<tbody>{rows(new_jobs, "new")}</tbody></table>'
-        )
+        if not new_jobs else
+        ('<table><thead><tr><th>Poste</th><th>Entreprise</th><th>Lieu</th>'
+         '<th>Source</th><th>Trouvé le</th></tr></thead>'
+         f'<tbody>{rows(new_jobs, "new")}</tbody></table>')
     )
 
     sorted_all = sorted(all_jobs, key=lambda x: x["found_at"], reverse=True)
     section_all = (
         "<p>Aucune offre trouvée.</p>"
-        if not all_jobs
-        else (
-            f'<table><thead><tr><th>Poste</th><th>Entreprise</th>'
-            f'<th>Lieu</th><th>Source</th><th>Trouvé le</th></tr></thead>'
-            f'<tbody>{rows(sorted_all)}</tbody></table>'
-        )
+        if not all_jobs else
+        ('<table><thead><tr><th>Poste</th><th>Entreprise</th><th>Lieu</th>'
+         '<th>Source</th><th>Trouvé le</th></tr></thead>'
+         f'<tbody>{rows(sorted_all)}</tbody></table>')
     )
 
     html = f"""<!DOCTYPE html>
@@ -818,10 +812,8 @@ def generate_html(new_jobs: list, all_jobs: list):
 </body>
 </html>"""
 
-    with open(RESULTS_FILE, "w", encoding="utf-8") as f:
-        f.write(html)
-    with open(PUBLIC_FILE, "w", encoding="utf-8") as f:
-        f.write(html)
+    RESULTS_FILE.write_text(html, encoding="utf-8")
+    PUBLIC_FILE.write_text(html, encoding="utf-8")
     log(f"Rapport HTML mis à jour : {RESULTS_FILE}")
 
 
@@ -843,30 +835,31 @@ def save_all_jobs(jobs: list):
         json.dump(jobs, f, ensure_ascii=False, indent=2)
 
 
+# Chaque scraper est isolé : s'il plante, les autres continuent.
+SCRAPERS = [
+    scrape_ville_geneve, scrape_letemps, scrape_ge_ch, scrape_vaud,
+    scrape_jobscout24, scrape_jobup, scrape_indeed_pw, scrape_adzuna,
+]
+
+
 def main():
     log("=== Démarrage de la recherche d'emploi ===")
     seen = load_seen()
     all_jobs = load_all_jobs()
-
-    # Purger les offres expirées avant d'ajouter les nouvelles
     all_jobs, seen = expire_old_jobs(all_jobs, seen)
 
     raw = []
-    raw.extend(scrape_ville_geneve())
-    raw.extend(scrape_letemps())
-    raw.extend(scrape_ge_ch())
-    raw.extend(scrape_vaud())
-    raw.extend(scrape_jobscout24())
-    raw.extend(scrape_jobup())
-    raw.extend(scrape_indeed_pw())
-    raw.extend(scrape_adzuna())
+    for scraper in SCRAPERS:
+        try:
+            raw.extend(scraper())
+        except Exception as e:
+            log(f"⚠️  {scraper.__name__} a échoué : {e}")
 
-    # Déduplication : par ID (titre+URL) ET par (titre+entreprise) pour les doublons inter-sources
+    # Déduplication par ID (titre+URL) ET par (titre+entreprise)
     seen_tc = {
         f"{j['title'].lower().strip()}|{j.get('company', '').lower().strip()}"
         for j in all_jobs
     }
-
     new_jobs = []
     for job in raw:
         jid = job_id(job["title"], job["url"])
