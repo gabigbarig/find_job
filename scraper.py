@@ -3,16 +3,36 @@
 
 import json
 import re
+import shutil
 import time
 import hashlib
 import smtplib
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    # Playwright est installé mais ses binaires manquent sur Ubuntu 26.04 ;
+    # on cherche un Chromium système (snap ou apt) pour le remplacer.
+    _CHROMIUM_PATH = (
+        shutil.which("chromium-browser")
+        or shutil.which("chromium")
+        or ("/snap/bin/chromium" if Path("/snap/bin/chromium").exists() else None)
+    )
+    PLAYWRIGHT_AVAILABLE = _CHROMIUM_PATH is not None
+    if not PLAYWRIGHT_AVAILABLE:
+        print(
+            "[INFO] Playwright installé mais aucun Chromium système trouvé.\n"
+            "       Pour activer Indeed : sudo snap install chromium"
+        )
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    _CHROMIUM_PATH = None
 
 # --- Adzuna API (agrège Indeed, LinkedIn, et +200 boards) ---
 # Inscription gratuite sur https://developer.adzuna.com/
@@ -26,6 +46,9 @@ ADZUNA_KEY = "e649b514710a4094554f36782966fb30"
 SMTP_FROM = ""   # ex: "tonprenom@gmail.com"
 SMTP_PASS = ""
 
+# Offres de plus de EXPIRY_DAYS jours retirées de la base à chaque run
+EXPIRY_DAYS = 60
+
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -36,7 +59,8 @@ RESULTS_FILE = DATA_DIR / "results.html"
 PUBLIC_FILE = DOCS_DIR / "index.html"
 LOG_FILE = DATA_DIR / "scraper.log"
 
-HEADERS = {
+SESSION = requests.Session()
+SESSION.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -44,7 +68,10 @@ HEADERS = {
     ),
     "Accept-Language": "fr-CH,fr;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+})
+
+# Gardé pour les scrapers qui construisent leurs propres headers Oracle/Adzuna
+HEADERS = dict(SESSION.headers)
 
 KEYWORDS = [
     "professeur français",
@@ -178,6 +205,26 @@ def job_id(title: str, url: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
+    """Retire les offres de plus de EXPIRY_DAYS jours et leurs hashes de seen."""
+    cutoff = datetime.now() - timedelta(days=EXPIRY_DAYS)
+    fresh, expired_ids = [], set()
+    for j in all_jobs:
+        try:
+            found_at = datetime.fromisoformat(j["found_at"])
+        except (KeyError, ValueError):
+            fresh.append(j)
+            continue
+        if found_at >= cutoff:
+            fresh.append(j)
+        else:
+            expired_ids.add(job_id(j["title"], j["url"]))
+    removed = len(all_jobs) - len(fresh)
+    if removed:
+        log(f"Expiration : {removed} offre(s) de plus de {EXPIRY_DAYS} jours retirées")
+    return fresh, seen - expired_ids
+
+
 def is_relevant(title: str, description: str = "") -> bool:
     text = (title + " " + description).lower()
     if any(k.lower() in text for k in EXCLUDE_KEYWORDS):
@@ -193,7 +240,7 @@ def is_relevant(title: str, description: str = "") -> bool:
 def fetch(url: str, retries: int = 3):
     for attempt in range(retries):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = SESSION.get(url, timeout=15)
             r.raise_for_status()
             return BeautifulSoup(r.text, "lxml")
         except Exception as e:
@@ -205,58 +252,6 @@ def fetch(url: str, retries: int = 3):
 # ---------------------------------------------------------------------------
 # Scrapers
 # ---------------------------------------------------------------------------
-
-def scrape_jura() -> list:
-    """Offres du Canton du Jura — enseignement et administration."""
-    jobs = []
-    pages = [
-        (
-            "https://www.jura.ch/fr/Autorites/Administration/DFI/SRH/"
-            "Offres-d-emploi/Offres-d-emploi-Enseignement.html",
-            "jura.ch (enseignement)",
-        ),
-        (
-            "https://www.jura.ch/fr/Autorites/Administration/DFI/SRH/"
-            "Offres-d-emploi-Administration/Offres-d-emploi-Administration.html",
-            "jura.ch (administration)",
-        ),
-        (
-            "https://www.jura.ch/fr/Autorites/Administration/DFI/SRH/"
-            "Offres-d-emploi/Offres-d-emploi-Autres.html",
-            "jura.ch (autres)",
-        ),
-    ]
-
-    for page_url, source_label in pages:
-        soup = fetch(page_url)
-        if not soup:
-            continue
-
-        found_on_page = 0
-        for a in soup.select("a[href*='/Htdocs/']"):
-            href = a["href"]
-            if not href.startswith("http"):
-                href = "https://www.jura.ch" + href
-            raw_title = a.get_text(strip=True)
-            title = re.sub(r"\s*\(PDF[^)]*\)\s*$", "", raw_title).strip()
-            if not title:
-                continue
-            if is_relevant(title):
-                jobs.append({
-                    "title": title,
-                    "company": "Canton du Jura",
-                    "url": href,
-                    "source": source_label,
-                    "location": "Jura",
-                    "found_at": datetime.now().isoformat(),
-                })
-                found_on_page += 1
-
-        time.sleep(1)
-        log(f"{source_label}: {found_on_page} offre(s) trouvée(s)")
-
-    return jobs
-
 
 def scrape_ville_geneve() -> list:
     """Offres de la Ville de Genève (administration municipale)."""
@@ -349,7 +344,7 @@ def scrape_vaud() -> list:
         "ora-irc-vanity-domain": "Y",
     }
     try:
-        r = requests.get(api_url, headers=headers_oracle, timeout=20)
+        r = SESSION.get(api_url, headers=headers_oracle, timeout=20)
         r.raise_for_status()
         data = r.json()
         reqs = data.get("items", [{}])[0].get("requisitionList", [])
@@ -377,122 +372,6 @@ def scrape_vaud() -> list:
         log(f"offres-emploi.vd.ch: {found} offre(s) trouvée(s) sur {len(reqs)} total")
     except Exception as e:
         log(f"Erreur scrape_vaud: {e}")
-    return jobs
-
-
-def scrape_fribourg() -> list:
-    """Offres de l'État de Fribourg via jobs.fr.ch."""
-    jobs = []
-    url = "https://jobs.fr.ch/search/?createNewAlert=false&q=&locationsearch=&optionsFacets"
-    soup = fetch(url)
-    if not soup:
-        return jobs
-
-    found = 0
-    seen_urls: set = set()
-    for div in soup.select("div.job"):
-        link = div.select_one("a[href]")
-        if not link:
-            continue
-        title = link.get_text(strip=True)
-        href = link.get("href", "")
-        if not title or not href:
-            continue
-        full_url = "https://jobs.fr.ch" + href if href.startswith("/") else href
-        if full_url in seen_urls:
-            continue
-        seen_urls.add(full_url)
-        if is_relevant(title):
-            jobs.append({
-                "title": title,
-                "company": "État de Fribourg",
-                "url": full_url,
-                "source": "jobs.fr.ch",
-                "location": "Fribourg",
-                "found_at": datetime.now().isoformat(),
-            })
-            found += 1
-
-    log(f"jobs.fr.ch (Fribourg): {found} offre(s) trouvée(s)")
-    return jobs
-
-
-def scrape_lausanne() -> list:
-    """Offres de la Ville de Lausanne via Oracle HCM REST API."""
-    jobs = []
-    oracle_base = "https://fa-ewrg-saasfaeuraprod1.fa.ocs.oraclecloud.com"
-    api_url = (
-        f"{oracle_base}/hcmRestApi/resources/11.13.18.05/"
-        "recruitingCEJobRequisitions"
-        "?expand=requisitionList"
-        "&finder=findReqs;siteNumber=CX_1,limit=500"
-    )
-    headers_oracle = {
-        **HEADERS,
-        "Accept": "application/json",
-        "ora-irc-vanity-domain": "Y",
-    }
-    try:
-        r = requests.get(api_url, headers=headers_oracle, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        reqs = data.get("items", [{}])[0].get("requisitionList", [])
-        found = 0
-        for job in reqs:
-            title = job.get("Title", "").strip()
-            jid = job.get("Id")
-            if not title or not jid:
-                continue
-            short_desc = job.get("ShortDescriptionStr") or ""
-            if is_relevant(title, short_desc):
-                url = (
-                    "https://www.lausanne.ch/officiel/travailler-a-la-ville/"
-                    f"nous-rejoindre/offres-emploi/detail-offre-emploi.html?id={jid}"
-                )
-                jobs.append({
-                    "title": title,
-                    "company": "Ville de Lausanne",
-                    "url": url,
-                    "source": "offres-emploi.lausanne.ch",
-                    "location": "Lausanne",
-                    "found_at": datetime.now().isoformat(),
-                })
-                found += 1
-        log(f"offres-emploi.lausanne.ch: {found} offre(s) trouvée(s) sur {len(reqs)} total")
-    except Exception as e:
-        log(f"Erreur scrape_lausanne: {e}")
-    return jobs
-
-
-def scrape_bcu_lausanne() -> list:
-    """Offres de la Bibliothèque Cantonale et Universitaire de Lausanne (WordPress)."""
-    jobs = []
-    url = "https://www.bcu-lausanne.ch/emplois/"
-    soup = fetch(url)
-    if not soup:
-        return jobs
-
-    found = 0
-    for article in soup.select("article.job-item"):
-        title_el = article.select_one("h2 a, h3 a")
-        if not title_el:
-            continue
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        if not title or not href:
-            continue
-        if is_relevant(title):
-            jobs.append({
-                "title": title,
-                "company": "BCU Lausanne",
-                "url": href,
-                "source": "bcu-lausanne.ch",
-                "location": "Lausanne",
-                "found_at": datetime.now().isoformat(),
-            })
-            found += 1
-
-    log(f"bcu-lausanne.ch: {found} offre(s) trouvée(s)")
     return jobs
 
 
@@ -534,7 +413,7 @@ def scrape_jobscout24() -> list:
         for region_code, zone_filter in search_configs:
             url = f"{BASE}/fr/jobs/{kw}/?region={region_code}"
             try:
-                r = requests.get(url, headers=HEADERS, timeout=15)
+                r = SESSION.get(url, timeout=15)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
@@ -609,7 +488,7 @@ def scrape_jobup() -> list:
         for geo_param, zone_filter in SEARCH_CONFIGS:
             url = f"{BASE}/fr/emplois/?{geo_param}&term={quote(kw)}"
             try:
-                r = requests.get(url, headers=HEADERS, timeout=15)
+                r = SESSION.get(url, timeout=15)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
@@ -659,82 +538,6 @@ def scrape_jobup() -> list:
     return jobs
 
 
-def scrape_indeed() -> list:
-    """Offres Indeed Suisse (ch-fr.indeed.com) — fiches individuelles uniquement.
-
-    Indeed rend ses cards en SSR. On garde seulement les URLs /voir-emploi?jk=…
-    pour ne jamais inclure une page de liste.
-    """
-    INDEED_QUERIES = [
-        ("rédacteur", "Genève"),
-        ("éditeur", "Genève"),
-        ("correcteur", "Genève"),
-        ("bibliothécaire", "Genève"),
-        ("traducteur", "Genève"),
-        ("chargé de projet culturel", "Genève"),
-        ("médiateur culturel", "Genève"),
-        ("archiviste", "Genève"),
-        ("journaliste", "Genève"),
-        ("documentaliste", "Genève"),
-    ]
-
-    jobs = []
-    seen_urls: set = set()
-    total = 0
-
-    for term, loc in INDEED_QUERIES:
-        url = f"https://ch-fr.indeed.com/emplois?q={quote(term)}&l={quote(loc)}&radius=30"
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            if r.status_code != 200:
-                log(f"Indeed [{term}]: HTTP {r.status_code}")
-                continue
-            soup = BeautifulSoup(r.text, "lxml")
-            cards = soup.select("div.job_seen_beacon")
-            if not cards:
-                # Sélecteur alternatif si Indeed change son HTML
-                cards = soup.select("div[data-testid='jobCard']")
-            for card in cards:
-                title_el = (
-                    card.select_one("h2.jobTitle span[title]")
-                    or card.select_one("h2.jobTitle a span")
-                )
-                link_el = card.select_one("h2.jobTitle a, h2 a[data-jk]")
-                loc_el = card.select_one("div.companyLocation, [data-testid='text-location']")
-                if not title_el or not link_el:
-                    continue
-                title = title_el.get("title") or title_el.get_text(strip=True)
-                title = title.strip()
-                href = link_el.get("href", "")
-                # Garder seulement les fiches individuelles
-                if "/voir-emploi" not in href and "/rc/clk" not in href and "jk=" not in href:
-                    continue
-                full_url = "https://ch-fr.indeed.com" + href if href.startswith("/") else href
-                if full_url in seen_urls:
-                    continue
-                location = loc_el.get_text(strip=True) if loc_el else "Genève"
-                job = {
-                    "title": title,
-                    "company": "—",
-                    "url": full_url,
-                    "source": "Indeed CH",
-                    "location": location,
-                    "found_at": datetime.now().isoformat(),
-                }
-                if not is_relevant(title):
-                    continue
-                seen_urls.add(full_url)
-                jobs.append(job)
-                total += 1
-        except Exception as e:
-            log(f"Erreur Indeed [{term}]: {e}")
-        time.sleep(1.5)
-
-    log(f"Indeed CH: {total} offre(s) trouvée(s)")
-    return jobs
-
-
-
 def scrape_adzuna() -> list:
     """Offres via l'API Adzuna — agrège Indeed, LinkedIn, JobScout, et +200 boards.
 
@@ -763,7 +566,7 @@ def scrape_adzuna() -> list:
             "&content-type=application/json"
         )
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = SESSION.get(url, timeout=15)
             if r.status_code != 200:
                 log(f"Adzuna [{kw}]: HTTP {r.status_code}")
                 continue
@@ -773,9 +576,7 @@ def scrape_adzuna() -> list:
                 desc = item.get("description", "")[:300]
                 company = item.get("company", {}).get("display_name", "—")
                 location = item.get("location", {}).get("display_name", "—")
-                from urllib.parse import urlparse
-                parsed = urlparse(link)
-                dedup_key = parsed.path
+                dedup_key = urlparse(link).path
                 if not title or not link or dedup_key in seen_urls:
                     continue
                 if not is_relevant(title, desc):
@@ -795,6 +596,91 @@ def scrape_adzuna() -> list:
         time.sleep(1)
 
     log(f"Adzuna: {total} offre(s) trouvée(s)")
+    return jobs
+
+
+INDEED_QUERIES = [
+    ("rédacteur", "Genève"), ("éditeur", "Genève"),
+    ("correcteur", "Genève"), ("bibliothécaire", "Genève"),
+    ("traducteur", "Genève"), ("médiateur culturel", "Genève"),
+    ("archiviste", "Genève"), ("journaliste", "Genève"),
+    ("chargé de projet culturel", "Genève"),
+]
+
+
+def scrape_indeed_pw() -> list:
+    """Offres Indeed CH via Playwright (vrai navigateur Chromium).
+
+    Nécessite un Chromium système : sudo snap install chromium
+    Si absent, la fonction retourne [] silencieusement.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        log("Indeed : Chromium système introuvable — source ignorée (sudo snap install chromium)")
+        return []
+
+    jobs = []
+    seen_urls: set = set()
+    total = 0
+
+    with _sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            executable_path=_CHROMIUM_PATH,
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+            locale="fr-CH",
+        )
+        page = ctx.new_page()
+
+        for term, loc in INDEED_QUERIES:
+            url = f"https://ch-fr.indeed.com/emplois?q={quote(term)}&l={quote(loc)}&radius=30"
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(1500)
+                soup = BeautifulSoup(page.content(), "lxml")
+                for card in soup.select("div.job_seen_beacon"):
+                    title_el = (
+                        card.select_one("h2.jobTitle span[title]")
+                        or card.select_one("h2.jobTitle a span")
+                    )
+                    link_el = card.select_one("h2.jobTitle a")
+                    loc_el = card.select_one("div.companyLocation")
+                    if not title_el or not link_el:
+                        continue
+                    title = (title_el.get("title") or title_el.get_text(strip=True)).strip()
+                    href = link_el.get("href", "")
+                    if "/voir-emploi" not in href and "jk=" not in href:
+                        continue
+                    full_url = "https://ch-fr.indeed.com" + href if href.startswith("/") else href
+                    if full_url in seen_urls:
+                        continue
+                    location = loc_el.get_text(strip=True) if loc_el else "Genève"
+                    if not is_relevant(title):
+                        continue
+                    seen_urls.add(full_url)
+                    jobs.append({
+                        "title": title,
+                        "company": "—",
+                        "url": full_url,
+                        "source": "Indeed CH",
+                        "location": location,
+                        "found_at": datetime.now().isoformat(),
+                    })
+                    total += 1
+            except Exception as e:
+                log(f"Indeed PW [{term}]: {e}")
+            time.sleep(2)
+
+        browser.close()
+
+    log(f"Indeed CH (Playwright): {total} offre(s) trouvée(s)")
     return jobs
 
 
@@ -962,6 +848,9 @@ def main():
     seen = load_seen()
     all_jobs = load_all_jobs()
 
+    # Purger les offres expirées avant d'ajouter les nouvelles
+    all_jobs, seen = expire_old_jobs(all_jobs, seen)
+
     raw = []
     raw.extend(scrape_ville_geneve())
     raw.extend(scrape_letemps())
@@ -969,19 +858,22 @@ def main():
     raw.extend(scrape_vaud())
     raw.extend(scrape_jobscout24())
     raw.extend(scrape_jobup())
-    raw.extend(scrape_indeed())
+    raw.extend(scrape_indeed_pw())
     raw.extend(scrape_adzuna())
 
-    # Déduplication : par ID (titre+URL) ET par titre seul (détecte les doublons inter-sources)
-    seen_titles = {j["title"].lower().strip() for j in all_jobs}
+    # Déduplication : par ID (titre+URL) ET par (titre+entreprise) pour les doublons inter-sources
+    seen_tc = {
+        f"{j['title'].lower().strip()}|{j.get('company', '').lower().strip()}"
+        for j in all_jobs
+    }
 
     new_jobs = []
     for job in raw:
         jid = job_id(job["title"], job["url"])
-        title_key = job["title"].lower().strip()
-        if jid not in seen and title_key not in seen_titles:
+        tc_key = f"{job['title'].lower().strip()}|{job.get('company', '').lower().strip()}"
+        if jid not in seen and tc_key not in seen_tc:
             seen.add(jid)
-            seen_titles.add(title_key)
+            seen_tc.add(tc_key)
             new_jobs.append(job)
             all_jobs.append(job)
 
