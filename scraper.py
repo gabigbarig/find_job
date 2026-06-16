@@ -1267,6 +1267,89 @@ def scrape_indeed_pw() -> list:
     return jobs
 
 
+# Mots-clés ciblés profil Lettres pour jobs.ch (limités pour borner les requêtes).
+JOBS_CH_QUERIES = [
+    "enseignant français", "professeur français", "bibliothécaire",
+    "archiviste", "documentaliste", "rédacteur", "correcteur",
+    "médiateur culturel", "chargé de projet culturel",
+]
+# Préfixe de date relative collé au titre dans la liste jobs.ch.
+_JOBSCH_DATE_RE = re.compile(
+    r"^(Aujourd'hui|Avant-hier|Hier|La semaine dernière|"
+    r"Il y a \d+\s+(?:minute|heure|jour|semaine|mois|an)s?)\s+", re.I)
+
+
+def _parse_jobs_ch_anchor(raw: str):
+    """Extrait (titre, lieu) du libellé d'un lien jobs.ch (date + titre + lieu collés)."""
+    title = _JOBSCH_DATE_RE.sub("", raw)
+    title = re.split(r"Lieu de travail|Taux d'|Salaire", title)[0].strip()
+    m = re.search(r"Lieu de travail\s*:?\s*(.+?)(?:\s+Taux|\s+Salaire|$)", raw)
+    location = m.group(1).strip() if m else "Genève"
+    return title, location
+
+
+def scrape_jobs_ch_pw() -> list:
+    """Offres jobs.ch via Playwright (rendu JS). Best-effort.
+
+    Plus gros board suisse, mais protégé (Cloudflare) et recouvrant largement
+    jobscout24 (même groupe JobCloud — la fusion des doublons par titre+employeur
+    regroupe les annonces communes). Nécessite un Chromium système.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        log("jobs.ch : Chromium système introuvable — source ignorée")
+        return []
+    jobs, seen_urls = [], set()
+    with _sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            executable_path=_CHROMIUM_PATH, headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
+        )
+        ctx = _new_stealth_context(browser)
+        page = ctx.new_page()
+        for term in JOBS_CH_QUERIES:
+            url = (f"https://www.jobs.ch/fr/offres-emplois/"
+                   f"?term={quote(term)}&location={quote('Genève')}")
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                try:
+                    page.wait_for_selector('a[href*="/offres-emplois/detail/"]',
+                                           timeout=8000)
+                except Exception:
+                    pass
+                soup = BeautifulSoup(page.content(), "lxml")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "/offres-emplois/detail/" not in href:
+                        continue
+                    full_url = ("https://www.jobs.ch" + href
+                                if href.startswith("/") else href)
+                    if full_url in seen_urls:
+                        continue
+                    title, location = _parse_jobs_ch_anchor(
+                        a.get_text(" ", strip=True))
+                    if not title or len(title) < 4:
+                        continue
+                    if not is_french_text(title):
+                        log(f"Rejeté (langue non-FR) : {title[:70]}")
+                        continue
+                    if not is_relevant(title) or is_fle(title):
+                        continue
+                    seen_urls.add(full_url)
+                    j = {
+                        "title": title, "company": "", "url": full_url,
+                        "source": "jobs.ch", "location": location,
+                        "description": "",
+                        "found_at": datetime.now().isoformat(),
+                    }
+                    jobs.append(finalize(j))
+            except Exception as e:
+                log(f"jobs.ch PW [{term}]: {e}")
+            time.sleep(2)
+        browser.close()
+    log(f"jobs.ch (Playwright): {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
 # Établissement employeur sur la page de détail ge.ch : « Lieu de travail
 # <établissement> Postuler ». SÉLECTEUR À AJUSTER SI BESOIN.
 _GE_LIEU_RE = re.compile(
@@ -1578,6 +1661,37 @@ def scrape_educh() -> list:
     return jobs
 
 
+def scrape_bibliosuisse() -> list:
+    """Offres bibliothécaire/archiviste/documentaliste — Bibliosuisse.
+
+    Board national de l'association suisse des bibliothèques. La plupart des
+    annonces sont alémaniques (écartées par la langue/les mots-clés français) ;
+    on conserve les romandes/genevoises. robots.txt : autorisé.
+    """
+    jobs, seen_urls = [], set()
+    url = "https://www.bibliosuisse.ch/fr/shop/offres-demploi"
+    soup = fetch(url)
+    if not soup:
+        return jobs
+    # SÉLECTEUR À AJUSTER SI BESOIN : chaque offre est un bloc .articlewrapper.
+    wraps = soup.select("div.articlewrapper")
+    for wrap in wraps:
+        a = wrap.find("a", href=True)
+        if not a:
+            continue
+        title = a.get_text(" ", strip=True)
+        href = a["href"]
+        if href and not href.startswith("http"):
+            href = urljoin(url, href)
+        consider(title, href,
+                 {"company": "", "source": "bibliosuisse.ch", "location": ""},
+                 jobs, seen_urls)
+    if not wraps:
+        log("⚠️  bibliosuisse.ch: 0 bloc d'offre — sélecteur potentiellement cassé")
+    log(f"bibliosuisse.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
 # ---------------------------------------------------------------------------
 # Auto-diagnostic de santé des sources (point 4)
 # ---------------------------------------------------------------------------
@@ -1599,7 +1713,7 @@ def save_health(health: dict):
 # Sources connues comme dormantes (domaine hors-ligne / mur anti-bot persistant).
 # On continue de suivre leur santé, mais sans émettre d'alerte de bruit tant
 # qu'on ne les a pas réparées/repointées (elles restent dans SCRAPERS).
-HEALTH_SILENT_SOURCES = {"educa", "indeed_pw"}
+HEALTH_SILENT_SOURCES = {"educa", "indeed_pw", "jobs_ch_pw"}
 
 
 def update_health(source: str, count: int, health: dict) -> list:
@@ -1813,11 +1927,11 @@ SCRAPERS = [
     # Universités & recherche (NOUVEAU)
     scrape_unige, scrape_myscience,
     # Culture / enseignement spécialisés (NOUVEAU)
-    scrape_museums, scrape_educa, scrape_educh,
+    scrape_museums, scrape_educa, scrape_educh, scrape_bibliosuisse,
     # Presse / privé
     scrape_letemps, scrape_jobscout24, scrape_jobup,
     # Agrégateurs
-    scrape_indeed_pw, scrape_adzuna,
+    scrape_indeed_pw, scrape_adzuna, scrape_jobs_ch_pw,
 ]
 
 
