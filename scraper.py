@@ -1704,9 +1704,10 @@ def generate_html(new_jobs: list, all_jobs: list):
         f'{header}<tbody>{rows(new_sorted, "new")}</tbody></table>'
     )
 
-    # Tri principal : score décroissant, puis date décroissante
+    # Tri principal : date « Trouvé le » décroissante (plus récentes en tête),
+    # puis score décroissant en cas d'égalité.
     all_sorted = sorted(all_jobs,
-                        key=lambda x: (x.get("score", 0), x["found_at"]),
+                        key=lambda x: (x["found_at"], x.get("score", 0)),
                         reverse=True)
     section_all = (
         "<p>Aucune offre trouvée.</p>"
