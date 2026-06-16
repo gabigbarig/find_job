@@ -226,8 +226,10 @@ EXCLUDE_KEYWORDS = [
     "greffier", "greffière", "droit international", "professeur de droit",
     # Langues étrangères non francophones (assistants de langue hors profil)
     "chinois", "mandarin", "langue chinoise",
-    # FLE / français langue étrangère (postes d'école de langues, hors profil)
-    "français langue étrangère", "français langue seconde",
+    # FLE / français langue étrangère (postes d'école de langues, hors profil).
+    # « fle » (abréviation) est rejeté en mot entier — détecté dans le TITRE comme
+    # dans la DESCRIPTION (cf. consider() qui lit la fiche pour les titres « français »).
+    "français langue étrangère", "français langue seconde", "fle",
 ]
 
 # Communes du district de Nyon PROCHES de Genève (zone resserrée).
@@ -315,6 +317,29 @@ _AMBIGUOUS_MARKERS = [
 ]
 _AMBIGUOUS_RE = _compile_terms(_AMBIGUOUS_MARKERS)
 
+# Titres « à risque FLE » : un poste touchant au français / aux langues peut
+# cacher du FLE (école de langues, hors profil) sans que le titre le dise. Pour
+# ceux-là on lit la fiche pour repérer un FLE caché dans la description.
+_FLE_RISK_RE = _compile_terms(["francais", "langue", "linguistique", "alphabetisation"])
+
+# Termes FLE proprement dits — exclusion CIBLÉE (détectée dans le titre OU la
+# description). Volontairement restreinte : on ne rejette que sur un vrai signal
+# FLE, pas sur le bruit d'une page (autres annonces, menus de catégories).
+_FLE_RE = _compile_terms([
+    "fle", "français langue étrangère", "français langue seconde",
+    "français langue d'intégration", "français langue d'accueil",
+])
+
+
+def fle_risk(title: str) -> bool:
+    """Vrai si le titre justifie de lire la fiche pour exclure un FLE caché."""
+    return term_in(normalize(title), _FLE_RISK_RE)
+
+
+def is_fle(title: str, description: str = "") -> bool:
+    """Vrai si un terme FLE figure dans le titre ou la description."""
+    return term_in(normalize(title + " " + description), _FLE_RE)
+
 # Détection de langue — mots exclusivement allemands (normalize() enlève les accents)
 _DE_STRONG = {
     "pflegefachfrau", "pflegefachmann", "pflegefachperson",
@@ -357,6 +382,15 @@ def relevance_score(title: str, description: str = "") -> int:
             score += 2          # présence dans le titre = signal fort
         elif kw.search(d_norm):
             score += 1
+    # Combinaison « enseignement + matière Lettres » : signal fort équivalent à un
+    # mot-clé. Indispensable pour rester COHÉRENT avec is_relevant() — sinon une
+    # offre acceptée par cette règle (ex. « Enseignant français ») garde un score 0
+    # et serait recalée par le seuil MIN_SCORE de passes_filters().
+    if term_in(t_norm, _TEACHING_RE) and term_in(t_norm, _SUBJECTS_RE):
+        score += 2
+    elif (term_in(t_norm + " " + d_norm, _TEACHING_RE)
+          and term_in(t_norm + " " + d_norm, _SUBJECTS_RE)):
+        score += 1
     return score
 
 
@@ -427,12 +461,19 @@ def robots_allows(url: str) -> bool:
     from urllib.robotparser import RobotFileParser
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    rp = _ROBOTS_CACHE.get(base)
-    if rp is None:
+    rp = _ROBOTS_CACHE.get(base, "MISS")
+    if rp == "MISS":
+        # On récupère le robots.txt avec NOTRE User-Agent (SESSION) : la lib
+        # urllib.read() utilise l'UA « Python-urllib » que certains sites (educh.ch)
+        # bloquent en 403, ce qui faisait conclure à tort « tout interdit ». On lit
+        # donc exactement le robots.txt qui s'applique à nos requêtes réelles.
         rp = RobotFileParser()
-        rp.set_url(urljoin(base, "/robots.txt"))
         try:
-            rp.read()
+            r = SESSION.get(urljoin(base, "/robots.txt"), timeout=10)
+            if r.status_code == 200:
+                rp.parse(r.text.splitlines())
+            else:
+                rp = None          # pas de robots.txt exploitable → pas de restriction
         except Exception:
             rp = None
         _ROBOTS_CACHE[base] = rp
@@ -787,7 +828,16 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
         return
     description = ""
     if is_relevant(title):
-        pass                                    # pertinent sur le titre seul
+        # Pertinent sur le titre seul. MAIS un poste « enseignant/formateur de
+        # français » peut être du FLE (hors profil) : si le titre touche au
+        # français/langues, on lit la fiche et on rejette UNIQUEMENT si un terme
+        # FLE y figure (test ciblé : pas sur le bruit de page / autres annonces).
+        # La fiche n'est lue QUE pour ce test : on ne la stocke pas comme
+        # description (elle peut contenir d'autres annonces/menus qui fausseraient
+        # la ré-validation par passes_filters()).
+        if fle_risk(title) and is_fle(title, fetch_description(url)):
+            log(f"Rejeté (FLE détecté dans la fiche) : {title[:70]}")
+            return
     elif title_is_ambiguous(title):
         description = fetch_description(url)     # on lit le détail
         if not is_relevant(title, description):
@@ -1463,13 +1513,69 @@ def scrape_educa() -> list:
     return jobs
 
 
-def scrape_educh() -> list:
-    """DÉSACTIVÉ : le robots.txt d'educh.ch interdit le scraping de /emploi/.
+_EDUCH_OFFER_RE = re.compile(r"/emploi/.+-e\d+\.html")
+# Le texte du lien educh accole au titre des métadonnées emoji :
+# « Titre 📍 Lieu 🕒 Taux 📄 Contrat Employeur ». SÉLECTEUR À AJUSTER SI BESOIN.
+_EDUCH_EMOJI = "📍🕒📄💼🗓️"
+_EDUCH_SEG_RE = re.compile(rf"([{_EDUCH_EMOJI}])\s*([^{_EDUCH_EMOJI}]*)")
+_EDUCH_CONTRACT_RE = re.compile(
+    r"^(CDI|CDD|Permanent|Temporaire|Stage|Auxiliaire|Mission|Apprentissage|"
+    r"Fixe|Int[ée]rim|Temps\s+partiel|Temps\s+plein)\b\s*", re.I)
 
-    Conservée à titre documentaire mais retirée du registre SCRAPERS. Ne pas
-    réactiver sans vérifier que les CGU et le robots.txt l'autorisent.
+
+def _parse_educh_anchor(text: str):
+    """Décompose le libellé d'un lien educh en (titre, lieu, taux, employeur).
+
+    L'employeur (segment 📄, après le type de contrat) sert de `company` réelle :
+    cela évite l'enrichissement par lecture de page (la page educh est polluée par
+    d'autres annonces, ce qui fausserait la pertinence). Champs absents → "".
     """
-    return []
+    title = re.split(rf"[{_EDUCH_EMOJI}]", text, maxsplit=1)[0].strip(" -–·|")
+    location = taux = company = ""
+    for marker, val in _EDUCH_SEG_RE.findall(text):
+        val = val.strip()
+        if marker == "📍":
+            location = val
+        elif marker == "🕒":
+            taux = val
+        elif marker == "📄":
+            company = _EDUCH_CONTRACT_RE.sub("", val).strip(" -–·,")
+    return title, location, taux, company
+
+
+def scrape_educh() -> list:
+    """Offres educh.ch (petite enfance, social, enseignement spécialisé) — Genève.
+
+    Le robots.txt d'educh.ch autorise le crawl (User-agent: * sans Disallow, et un
+    sitemap d'offres dédié). On lit directement la liste DÉJÀ filtrée par canton
+    pour ne garder que Genève sans parcourir les ~300 offres nationales.
+    """
+    jobs, seen_urls = [], set()
+    raw_links = 0
+    # Listes filtrées canton + ville de Genève (seen_urls évite les doublons).
+    for url in ("https://www.educh.ch/emploi/geneve-canton/",
+                "https://www.educh.ch/emploi/geneve-ville/"):
+        soup = fetch(url)
+        if not soup:
+            continue
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not _EDUCH_OFFER_RE.search(href):
+                continue
+            raw_links += 1
+            if not href.startswith("http"):
+                href = urljoin("https://www.educh.ch", href)
+            title, location, taux, company = _parse_educh_anchor(
+                a.get_text(" ", strip=True))
+            fields = {"company": company or "educh.ch", "source": "educh.ch",
+                      "location": location or "Genève"}
+            if taux:
+                fields["taux"] = taux
+            consider(title, href, fields, jobs, seen_urls)
+    if raw_links == 0:
+        log("⚠️  educh.ch: 0 lien d'offre extrait — sélecteur potentiellement cassé")
+    log(f"educh.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
 
 
 # ---------------------------------------------------------------------------
@@ -1706,7 +1812,7 @@ SCRAPERS = [
     # Universités & recherche (NOUVEAU)
     scrape_unige, scrape_myscience,
     # Culture / enseignement spécialisés (NOUVEAU)
-    scrape_museums, scrape_educa,
+    scrape_museums, scrape_educa, scrape_educh,
     # Presse / privé
     scrape_letemps, scrape_jobscout24, scrape_jobup,
     # Agrégateurs
