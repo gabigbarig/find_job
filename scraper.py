@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
-"""Agent de recherche d'emploi - Lettres Modernes - Genève.
+"""Agent de recherche d'emploi - Lettres Modernes - Genève & arc lémanique.
 
-Améliorations par rapport à la version initiale :
-- Secrets (clés API, mot de passe SMTP) chargés depuis l'environnement / .env,
-  plus jamais en clair dans le code.
-- Échappement HTML systématique dans le rapport généré.
-- Normalisation Unicode pour un matching robuste aux accents (français/francais).
-- User-Agent unique et centralisé.
-- fetch() applique un délai poli et un back-off exponentiel.
-- Vérification optionnelle de robots.txt avant chaque requête.
-- Avertissement loggué quand un scraper retourne 0 offre de façon anormale.
+═══════════════════════════════════════════════════════════════════════════
+AMÉLIORATIONS PALIER 1 (par rapport à la version précédente)
+═══════════════════════════════════════════════════════════════════════════
+1. LECTURE DES DESCRIPTIONS : pour les offres au titre ambigu, le scraper va
+   chercher la page de détail et analyse le texte complet. Ne rate plus les
+   titres « déguisés » (« Collaborateur scientifique » parlant en fait de FLE).
+2. NOUVELLES SOURCES : UNIGE (jobs.unige.ch), myScience (agrège toutes les
+   universités suisses), museums.ch, kultur-vermittlung.ch, educa.ch.
+3. MOTS-CLÉS ÉLARGIS : genres neutres, métiers proches, terminologie scolaire
+   suisse et culturelle.
+4. AUTO-DIAGNOSTIC : chaque source enregistre son nombre d'offres dans un
+   historique de santé (data/health.json) et alerte si une source qui
+   produisait des résultats tombe brutalement à 0 (= sélecteur cassé).
+5. DONNÉES ENRICHIES : description, taux d'activité (%) et score de pertinence
+   stockés pour chaque offre ; tri par score dans le rapport.
+
+Les améliorations 1, 3, 4, 5 ne dépendent d'AUCUN sélecteur : elles sont
+fiables immédiatement. Les nouveaux scrapers (point 2) utilisent des
+sélecteurs « best effort » : s'ils ne matchent pas, l'auto-diagnostic te le
+signale, et chaque sélecteur est isolé en tête de fonction, facile à corriger.
+═══════════════════════════════════════════════════════════════════════════
 """
 
 import json
 import os
 import re
 import shutil
+import socket
 import time
 import hashlib
 import smtplib
@@ -25,10 +38,10 @@ from email.mime.text import MIMEText
 from html import escape
 from pathlib import Path
 from urllib.parse import quote, urlparse, urljoin
-from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
+
 
 # --- Chargement optionnel d'un fichier .env (sans dépendance externe) ---
 def _load_dotenv(path: Path):
@@ -58,32 +71,42 @@ try:
     if not PLAYWRIGHT_AVAILABLE:
         print(
             "[INFO] Playwright installé mais aucun Chromium système trouvé.\n"
-            "       Pour activer Indeed : sudo snap install chromium"
+            "       Pour activer Indeed : sudo apt install chromium-browser"
         )
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     _CHROMIUM_PATH = None
 
-# --- Adzuna API (agrège Indeed, LinkedIn, et +200 boards) ---
-# Inscription gratuite sur https://developer.adzuna.com/
-ADZUNA_ID  = "e91c32be"
-ADZUNA_KEY = "e649b514710a4094554f36782966fb30"
+# ---------------------------------------------------------------------------
+# Configuration (secrets chargés depuis l'environnement / .env)
+# ---------------------------------------------------------------------------
 
-# Alertes email (optionnel). Mot de passe d'application Google (16 caractères),
-# PAS le vrai mot de passe. https://myaccount.google.com/apppasswords
-# À définir dans .env : SMTP_FROM=... / SMTP_PASS=... / SMTP_TO=...
+ADZUNA_ID = os.environ.get("ADZUNA_ID", "")
+ADZUNA_KEY = os.environ.get("ADZUNA_KEY", "")
+
 SMTP_FROM = os.environ.get("SMTP_FROM", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_TO = os.environ.get("SMTP_TO", "")
 
-# Respecter robots.txt avant chaque requête (recommandé : True)
 RESPECT_ROBOTS = os.environ.get("RESPECT_ROBOTS", "1") not in ("0", "false", "False")
-
-# Offres de plus de EXPIRY_DAYS jours retirées de la base à chaque run
 EXPIRY_DAYS = int(os.environ.get("EXPIRY_DAYS", "60"))
-
-# Délai poli minimum entre deux requêtes vers un même domaine (secondes)
 POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "1.0"))
+
+# Score de pertinence minimal pour qu'une offre soit retenue (posture stricte).
+# Un mot-clé dans le titre vaut 2 ; un mot-clé en description vaut 1. À 2, on
+# écarte les titres génériques (« Collaborateur scientifique ») relevés par un
+# seul mot-clé faible en description. Mettre 1 pour une posture plus tolérante.
+MIN_SCORE = int(os.environ.get("MIN_SCORE", "2"))
+
+# Activer la lecture des pages de détail pour les titres ambigus (point 1).
+# Coûte une requête supplémentaire par offre « limite », mais récupère les
+# offres au titre neutre. Désactivable via FETCH_DESCRIPTIONS=0.
+FETCH_DESCRIPTIONS = os.environ.get("FETCH_DESCRIPTIONS", "1") not in ("0", "false", "False")
+# Nombre max de pages de détail récupérées par run (garde-fou anti-explosion)
+MAX_DETAIL_FETCHES = int(os.environ.get("MAX_DETAIL_FETCHES", "40"))
+# Budget dédié à l'extraction de l'employeur (lecture des pages de détail des
+# offres nouvelles sans entreprise). Séparé pour ne pas concurrencer ci-dessus.
+MAX_EMPLOYER_FETCHES = int(os.environ.get("MAX_EMPLOYER_FETCHES", "40"))
 
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -93,8 +116,9 @@ SEEN_FILE = DATA_DIR / "seen_jobs.json"
 RESULTS_FILE = DATA_DIR / "results.html"
 PUBLIC_FILE = DOCS_DIR / "index.html"
 LOG_FILE = DATA_DIR / "scraper.log"
+HEALTH_FILE = DATA_DIR / "health.json"      # historique de santé des sources
+RSS_FILE = DOCS_DIR / "feed.xml"            # flux RSS en sortie (bonus)
 
-# User-Agent unique, centralisé (utilisé partout : requests ET Playwright)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -110,62 +134,117 @@ SESSION.headers.update({
 HEADERS = dict(SESSION.headers)
 
 # ---------------------------------------------------------------------------
-# Mots-clés et zones (inchangés)
+# Mots-clés et zones — ÉLARGIS (point 3)
 # ---------------------------------------------------------------------------
 
 KEYWORDS = [
+    # --- Enseignement (gymnase / post-obligatoire — PAS de FLE) ---
     "professeur français", "professeur de français", "enseignant français",
-    "rédacteur", "rédactrice", "libraire", "éditeur", "éditrice",
-    "correcteur", "correctrice", "journaliste", "lettres", "bibliothécaire",
-    "chargé de communication", "chargée de communication",
-    "attaché de presse", "attachée de presse", "maison d'édition",
-    "traducteur", "traductrice", "archiviste", "documentaliste",
-    "médiateur culturel", "médiatrice culturelle",
-    "chargé de projet culturel", "chargée de projet culturel",
-    "animateur culturel", "animatrice culturelle", "muséologue",
-    "responsable culturel", "responsable de collection",
-    "chargé des publics", "chargée des publics", "médiation culturelle",
+    "enseignant de français", "maître de français", "maîtresse de français",
+    "français cdd", "expression orale", "diction", "culture générale",
+    "maturité", "gymnase", "post-obligatoire", "école de commerce",
+    "remplacement français", "suppléance", "chargé d'enseignement",
     "maître d'enseignement général / français",
     "maître d'enseignement général - français",
     "maître d'enseignement général – français",
     "maîtresse d'enseignement général / français",
     "maîtresse d'enseignement général - français",
     "maîtresse d'enseignement général – français",
-    "français langue étrangère", "français cdd", "expression orale",
-    "diction", "culture générale",
+    # --- Rédaction / édition ---
+    "rédacteur", "rédactrice", "rédacteur web", "concepteur-rédacteur",
+    "secrétaire de rédaction", "relecteur", "relectrice",
+    "correcteur", "correctrice", "lecteur-correcteur", "rewriter",
+    "éditeur", "éditrice", "assistant d'édition", "chargé d'édition",
+    "maison d'édition", "content manager", "content editor",
+    "iconographe", "concepteur de contenu",
+    # --- Bibliothèque / documentation / archives ---
+    "libraire", "bibliothécaire", "documentaliste", "archiviste",
+    "aide-bibliothécaire", "agent en information documentaire",
+    "spécialiste en information documentaire",
+    # --- Journalisme / communication ---
+    "journaliste", "journaliste rédacteur", "chargé de communication",
+    "chargée de communication", "attaché de presse", "attachée de presse",
+    "responsable de communication", "community manager",
+    "chargé de contenu éditorial",
+    # --- Traduction ---
+    # NB : « réviseur » nu retiré (= réviseur comptable/audit) ; on garde la
+    # forme métier « traducteur-réviseur ».
+    "traducteur", "traductrice", "traducteur-réviseur",
+    # --- Culture / médiation / patrimoine ---
+    "médiateur culturel", "médiatrice culturelle", "médiation culturelle",
+    "chargé de projet culturel", "chargée de projet culturel",
+    "chargé de production", "administrateur culturel",
+    "animateur culturel", "animatrice culturelle",
+    "muséologue", "commissaire d'exposition", "régisseur d'œuvres",
+    "chargé de collections", "responsable de collection",
+    "chargé des publics", "chargée des publics", "responsable culturel",
+    # --- Lettres / recherche / académique ---
+    # NB : « collaborateur/collaboratrice scientifique » retiré des mots-clés
+    # (trop générique) ; reste capté via le chemin « titre ambigu + description »
+    # s'il y a un vrai contexte Lettres dans l'annonce.
+    "lettres", "littérature", "assistant de recherche",
+    "maître assistant", "assistant doctorant",
+    "post-doctorant", "chargé de cours", "linguistique",
 ]
 
+# Termes désignant un poste d'enseignant (conventions cantonales variées)
 TEACHING_TERMS = [
-    "enseignement", "enseignant", "enseignante",
-    "maître", "maîtresse", "professeur", "professeure",
+    "enseignement", "enseignant", "enseignante", "maître", "maîtresse",
+    "professeur", "professeure", "chargé de cours", "chargée de cours",
 ]
 
+# Matières / domaines liés aux Lettres Modernes
 LETTRES_SUBJECTS = [
-    "français", "lettres", "littérature", "expression orale",
-    "diction", "français langue étrangère", "culture générale",
+    "français", "lettres", "littérature", "expression orale", "diction",
+    "culture générale", "linguistique",
+    "édition", "rédaction", "communication", "médiation", "patrimoine",
 ]
 
 EXCLUDE_KEYWORDS = [
-    "informatique", "ingénieur", "développeur", "comptable",
-    "médecin", "infirmier", "avocat", "électricien", "chauffeur",
-    "technicien", "mécanicien",
+    "informatique", "ingénieur", "développeur", "comptable", "médecin",
+    "infirmier", "infirmière", "avocat", "électricien", "chauffeur",
+    "technicien", "technicienne", "mécanicien", "soudeur", "plombier",
+    "maçon", "cuisinier", "serveur", "vendeur automobile", "pépiniériste",
+    "chef de culture", "viticole", "horticole",
+    # Domaines scientifiques / techniques / labo (évite biologie, chimie…)
+    "biologie", "biologiste", "chimie", "chimiste", "physique",
+    "laboratoire", "labo", "culture cellulaire", "microbiologie",
+    "biochimie", "pharma", "pharmaceutique", "analyste de laboratoire",
+    "assistant technique", "assistante technique", "informaticien",
+    "data scientist", "data analyst", "électronique", "robotique",
+    "génie civil", "architecte", "géomètre", "dessinateur",
+    # Santé / soins (hors Lettres)
+    "soins", "soignant", "aide-soignant", "physiothérapeute",
+    "ergothérapeute", "pharmacien", "dentiste", "vétérinaire",
+    # Droit / juridique / sciences politiques
+    "juriste", "juridique", "droit pénal", "droit civil", "sciences politiques",
+    # Psychologie / orientation professionnelle
+    "psychologue", "conseiller d'orientation", "conseillère d'orientation",
+    # Économie / finance
+    "économiste", "fiscalité", "audit", "auditeur", "réviseur d'entreprise",
+    # Justice / greffe (capté à tort par « rédacteur »)
+    "greffier", "greffière", "droit international", "professeur de droit",
+    # Langues étrangères non francophones (assistants de langue hors profil)
+    "chinois", "mandarin", "langue chinoise",
+    # FLE / français langue étrangère (postes d'école de langues, hors profil)
+    "français langue étrangère", "français langue seconde",
 ]
 
+# Communes du district de Nyon PROCHES de Genève (zone resserrée).
+# On exclut volontairement Gland, Rolle, Lausanne, Morges (trop loin).
 VAUD_ZONE = {
-    "nyon", "gland", "coppet", "prangins", "rolle", "mies", "tannay",
-    "commugny", "founex", "bogis", "chavannes-de-bogis",
-    "chavannes-des-bois", "borex", "eysins", "signy", "genolier",
-    "gingins", "givrins", "arzier", "saint-cergue", "coinsins", "vich",
-    "grens", "dully", "luins", "gilly", "tartegnin", "perroy",
-    "allaman", "aubonne",
+    "nyon", "coppet", "prangins", "mies", "tannay", "commugny",
+    "founex", "bogis", "chavannes-de-bogis", "chavannes-des-bois",
+    "borex", "eysins", "signy", "crassier", "grens", "duillier",
+    "arnex-sur-nyon", "trélex", "givrins", "genolier",
 }
 
 GENEVE_ZONE = {
-    "genève", "geneva", "carouge", "lancy", "meyrin", "vernier", "onex",
-    "plan-les-ouates", "thônex", "bernex", "chêne-bougeries",
-    "chêne-bourg", "pregny-chambésy", "grand-saconnex", "satigny",
-    "dardagny", "russin", "avully", "avusy", "cartigny", "chancy",
-    "laconnex", "soral", "gy", "jussy", "choulex", "cologny",
+    "genève", "geneva", "genf", "carouge", "lancy", "meyrin", "vernier",
+    "onex", "plan-les-ouates", "thônex", "bernex", "chêne-bougeries",
+    "chêne-bourg", "pregny-chambésy", "grand-saconnex", "saconnex",
+    "satigny", "dardagny", "russin", "avully", "avusy", "cartigny",
+    "chancy", "laconnex", "soral", "gy", "jussy", "choulex", "cologny",
     "vandoeuvres", "puplinge", "presinge", "meinier",
     "collonge-bellerive", "hermance", "anières", "corsier", "céligny",
     "bellevue", "genthod", "versoix", "collex-bossy",
@@ -184,21 +263,68 @@ def log(msg: str):
 
 
 def normalize(text: str) -> str:
-    """Minuscule + suppression des accents, pour un matching robuste.
-
-    'Français' et 'Francais' deviennent tous deux 'francais'.
-    """
+    """Minuscule + suppression des accents pour un matching robuste."""
     text = text.lower()
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return text
 
 
-# Versions normalisées (pré-calculées une fois) pour is_relevant
-_KW_NORM = [normalize(k) for k in KEYWORDS]
-_EXCLUDE_NORM = [normalize(k) for k in EXCLUDE_KEYWORDS]
-_TEACHING_NORM = [normalize(t) for t in TEACHING_TERMS]
-_SUBJECTS_NORM = [normalize(s) for s in LETTRES_SUBJECTS]
+# --- Matching « mot entier » (corrige les faux positifs par sous-chaîne) ---
+# Avant, `k in text` faisait matcher « sion » (Sion/Valais) dans « expression »,
+# « labo » dans « collaboration », « bern » dans « bernex »… On compile chaque
+# terme en regex à frontières de mot, tolérante à la typographie inclusive
+# (rédacteur·trice, greffier-ère) et au pluriel léger.
+_TERM_SEP = r"[\s\-·•/'’*.()]+"      # séparateurs internes/typographiques tolérés
+
+
+def _compile_term(term: str, inflect: bool = True) -> "re.Pattern":
+    """Compile un mot-clé en regex à frontières de mot (sur texte normalisé).
+
+    inflect=True tolère un pluriel léger en -s (agent → agents). Désactivé pour
+    les noms de lieux, qui ne s'accordent pas (sinon « berne » matcherait
+    « bernex », commune genevoise).
+    """
+    words = normalize(term).split()
+    body = _TERM_SEP.join(re.escape(w) for w in words)
+    suffix = r"s?" if inflect else r""
+    return re.compile(rf"\b{body}{suffix}\b")
+
+
+def _compile_terms(terms, inflect: bool = True) -> list:
+    return [_compile_term(t, inflect) for t in terms]
+
+
+def term_in(text_norm: str, patterns: list) -> bool:
+    """Vrai si l'un des motifs compilés apparaît (mot entier) dans le texte normalisé."""
+    return any(p.search(text_norm) for p in patterns)
+
+
+_KW_RE = _compile_terms(KEYWORDS)
+_EXCLUDE_RE = _compile_terms(EXCLUDE_KEYWORDS)
+_TEACHING_RE = _compile_terms(TEACHING_TERMS)
+_SUBJECTS_RE = _compile_terms(LETTRES_SUBJECTS)
+
+# Marqueurs de titre générique : déclenchent la lecture de la description.
+_AMBIGUOUS_MARKERS = [
+    "collaborateur", "collaboratrice", "assistant", "assistante",
+    "charge de mission", "chargee de mission", "charge de projet",
+    "chargee de projet", "specialiste", "responsable", "adjoint",
+    "coordinateur", "coordinatrice", "gestionnaire", "conseiller",
+    "conseillere", "agent", "stagiaire",
+]
+_AMBIGUOUS_RE = _compile_terms(_AMBIGUOUS_MARKERS)
+
+# Détection de langue — mots exclusivement allemands (normalize() enlève les accents)
+_DE_STRONG = {
+    "pflegefachfrau", "pflegefachmann", "pflegefachperson",
+    "nachtwache", "ausbildung", "verantwortung", "bewerber",
+    "stellenanzeige", "fachverantwortung", "privatstation", "arbeitszeit",
+    "dienstleistung", "anforderungen",
+}
+_DE_COMMON = {
+    "und", "fur", "nach", "beim", "stelle", "kenntnisse", "haben", "sein",
+}
 
 
 def load_seen() -> set:
@@ -218,8 +344,61 @@ def job_id(title: str, url: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def relevance_score(title: str, description: str = "") -> int:
+    """Nombre de mots-clés distincts trouvés (titre compte double).
+
+    Sert à trier les offres : un score élevé = forte correspondance.
+    """
+    t_norm = normalize(title)
+    d_norm = normalize(description)
+    score = 0
+    for kw in _KW_RE:
+        if kw.search(t_norm):
+            score += 2          # présence dans le titre = signal fort
+        elif kw.search(d_norm):
+            score += 1
+    return score
+
+
+def is_relevant(title: str, description: str = "") -> bool:
+    text = normalize(title + " " + description)
+    if term_in(text, _EXCLUDE_RE):
+        return False
+    if term_in(text, _KW_RE):
+        return True
+    if term_in(text, _TEACHING_RE) and term_in(text, _SUBJECTS_RE):
+        return True
+    return False
+
+
+def is_french_text(title: str) -> bool:
+    """Retourne False si le titre est clairement en allemand.
+
+    Politique tolérante : en cas de doute on garde l'offre plutôt que de la rater.
+    """
+    words = set(normalize(title).split())
+    if words & _DE_STRONG:
+        return False
+    if len(words & _DE_COMMON) >= 2:
+        return False
+    return True
+
+
+def title_is_ambiguous(title: str) -> bool:
+    """Vrai si le titre ne matche pas seul mais mérite qu'on lise la description.
+
+    Cas typique : titres génériques (« collaborateur », « assistant »,
+    « chargé de mission ») qui peuvent cacher un poste Lettres.
+    """
+    t = normalize(title)
+    if term_in(t, _EXCLUDE_RE):
+        return False                       # exclu d'office, inutile d'aller plus loin
+    if term_in(t, _KW_RE):
+        return False                       # déjà pertinent, pas besoin du détail
+    return term_in(t, _AMBIGUOUS_RE)
+
+
 def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
-    """Retire les offres de plus de EXPIRY_DAYS jours et leurs hashes de seen."""
     cutoff = datetime.now() - timedelta(days=EXPIRY_DAYS)
     fresh, expired_ids = [], set()
     for j in all_jobs:
@@ -238,29 +417,14 @@ def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
     return fresh, seen - expired_ids
 
 
-def is_relevant(title: str, description: str = "") -> bool:
-    text = normalize(title + " " + description)
-    if any(k in text for k in _EXCLUDE_NORM):
-        return False
-    if any(k in text for k in _KW_NORM):
-        return True
-    if any(t in text for t in _TEACHING_NORM) and any(s in text for s in _SUBJECTS_NORM):
-        return True
-    return False
-
-
 # --- Cache des parseurs robots.txt par domaine ---
 _ROBOTS_CACHE: dict = {}
 
 
 def robots_allows(url: str) -> bool:
-    """Vérifie si l'URL est autorisée par le robots.txt du domaine.
-
-    En cas d'échec de lecture du robots.txt, on autorise par défaut (fail-open),
-    pour ne pas bloquer tout le scraper sur un domaine sans robots.txt.
-    """
     if not RESPECT_ROBOTS:
         return True
+    from urllib.robotparser import RobotFileParser
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     rp = _ROBOTS_CACHE.get(base)
@@ -270,7 +434,7 @@ def robots_allows(url: str) -> bool:
         try:
             rp.read()
         except Exception:
-            rp = None  # illisible : on autorisera
+            rp = None
         _ROBOTS_CACHE[base] = rp
     if rp is None:
         return True
@@ -285,7 +449,6 @@ _LAST_REQUEST: dict = {}
 
 
 def _polite_wait(url: str):
-    """Garantit au moins POLITE_DELAY secondes entre deux hits d'un même domaine."""
     domain = urlparse(url).netloc
     last = _LAST_REQUEST.get(domain, 0.0)
     elapsed = time.time() - last
@@ -294,8 +457,49 @@ def _polite_wait(url: str):
     _LAST_REQUEST[domain] = time.time()
 
 
+# Cache de résolution DNS par hôte (évite de re-tester un domaine mort à chaque URL).
+_DNS_CACHE: dict = {}
+
+
+def host_resolves(url: str) -> bool:
+    """Vrai si le nom d'hôte de l'URL résout en DNS.
+
+    Permet de sauter proprement un domaine hors-ligne (ex. job.educa.ch, NXDOMAIN)
+    SANS tenter un fetch voué à l'échec qui polluerait les logs d'« Erreur fetch ».
+    """
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    if host not in _DNS_CACHE:
+        try:
+            socket.getaddrinfo(host, None)
+            _DNS_CACHE[host] = True
+        except OSError:
+            _DNS_CACHE[host] = False
+    return _DNS_CACHE[host]
+
+
+def _is_permanent_error(exc: Exception) -> bool:
+    """Vrai si l'erreur ne se résoudra jamais en réessayant (DNS, 404, 403).
+
+    Inutile de boucler avec back-off sur un domaine qui n'existe pas (NXDOMAIN)
+    ou une ressource interdite/absente : on logue une fois et on abandonne.
+    """
+    msg = str(exc)
+    if "NameResolutionError" in msg or "Name or service not known" in msg:
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is not None and resp.status_code in (403, 404):
+        return True
+    return False
+
+
 def fetch(url: str, retries: int = 3):
-    """GET poli avec respect de robots.txt, délai par domaine et back-off."""
+    """GET poli avec respect de robots.txt, délai par domaine et back-off.
+
+    Les erreurs permanentes (DNS mort, 403, 404) coupent court : pas de retry.
+    Les vraies erreurs transitoires (timeout, 5xx) gardent les tentatives + back-off.
+    """
     if not robots_allows(url):
         log(f"robots.txt interdit : {url} — ignoré")
         return None
@@ -306,16 +510,70 @@ def fetch(url: str, retries: int = 3):
             r.raise_for_status()
             return BeautifulSoup(r.text, "lxml")
         except Exception as e:
+            if _is_permanent_error(e):
+                log(f"Erreur fetch {url} (définitive, pas de retry): {e}")
+                return None
             log(f"Erreur fetch {url} (tentative {attempt+1}): {e}")
             time.sleep(2 * (attempt + 1))
     return None
 
 
-def _warn_if_empty(source: str, jobs: list, expect_results: bool = True):
-    """Loggue un avertissement si un scraper censé produire des offres en renvoie 0.
+# --- Compteurs globaux de fetches de détail (garde-fous séparés) ---
+_detail_fetch_count = 0      # lecture des titres ambigus (consider)
+_employer_fetch_count = 0    # extraction de l'employeur (déduplication)
 
-    Un 0 soudain est souvent le signe d'un sélecteur CSS cassé (le site a changé).
+
+def _page_text(url: str) -> str:
+    """Récupère le texte visible de la page de détail d'une offre (sans budget)."""
+    soup = fetch(url, retries=2)
+    if not soup:
+        return ""
+    # On retire les éléments non pertinents puis on extrait le texte visible
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    text = main.get_text(" ", strip=True)
+    return text[:3000]      # borne pour rester raisonnable
+
+
+def fetch_description(url: str) -> str:
+    """Texte de détail pour lever l'ambiguïté d'un titre (point 1).
+
+    Respecte MAX_DETAIL_FETCHES pour ne pas exploser le nombre de requêtes.
+    Retourne "" si désactivé, quota atteint, ou échec.
     """
+    global _detail_fetch_count
+    if not FETCH_DESCRIPTIONS or _detail_fetch_count >= MAX_DETAIL_FETCHES:
+        return ""
+    _detail_fetch_count += 1
+    return _page_text(url)
+
+
+def fetch_employer_page(url: str) -> str:
+    """Texte de détail pour extraire l'employeur d'une offre sans entreprise.
+
+    Budget dédié (MAX_EMPLOYER_FETCHES), indépendant des fetches de titres
+    ambigus, pour ne pas gonfler le volume de requêtes du scraping lui-même.
+    """
+    global _employer_fetch_count
+    if _employer_fetch_count >= MAX_EMPLOYER_FETCHES:
+        return ""
+    _employer_fetch_count += 1
+    return _page_text(url)
+
+
+def extract_taux(text: str) -> str:
+    """Extrait un taux d'activité (ex. '80%', '50-100%') depuis un texte."""
+    m = re.search(r"(\d{1,3})\s*[-–à]\s*(\d{1,3})\s*%", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}%"
+    m = re.search(r"(\d{1,3})\s*%", text)
+    if m:
+        return f"{m.group(1)}%"
+    return ""
+
+
+def _warn_if_empty(source: str, jobs: list, expect_results: bool = True):
     if expect_results and not jobs:
         log(f"⚠️  {source}: 0 offre — sélecteur potentiellement cassé ou source bloquée")
 
@@ -329,50 +587,248 @@ def dedup_by_url(jobs: list) -> list:
     return unique
 
 
+def finalize(job: dict) -> dict:
+    """Complète une offre : score de pertinence + taux d'activité.
+
+    À appeler juste avant d'ajouter l'offre à la liste retournée.
+    """
+    desc = job.get("description", "")
+    job.setdefault("description", "")
+    job["score"] = relevance_score(job["title"], desc)
+    if not job.get("taux"):
+        job["taux"] = extract_taux(job["title"] + " " + desc)
+    return job
+
+
+def passes_filters(job: dict) -> bool:
+    """Gate de pertinence unique : exclusions, mots-clés, zone géo et score min.
+
+    Appliqué à TOUTES les offres (scrapers + ré-validation de l'archive), pour
+    une décision uniforme quel que soit le scraper d'origine.
+    """
+    title = job.get("title", "")
+    desc = job.get("description", "")
+    if not is_relevant(title, desc):
+        return False
+    # Lieu hors-zone mentionné dans le TITRE (ex. « … Musée Jenisch Vevey ») :
+    # in_zone ne regarde que lieu+description, on couvre donc aussi le titre.
+    if term_in(normalize(title), _GEO_FAR_RE):
+        return False
+    if not in_zone(job.get("location", ""), desc):
+        return False
+    score = job.get("score")
+    if score is None:
+        score = relevance_score(title, desc)
+    return score >= MIN_SCORE
+
+
 # ---------------------------------------------------------------------------
-# Scrapers
+# Identité de l'employeur (sert à la déduplication basée sur le contenu)
+# ---------------------------------------------------------------------------
+
+# Valeurs « bouche-trou » posées par les scrapers qui ignorent l'employeur.
+EMPLOYER_PLACEHOLDERS = {"", "—", "-", "n/a"}
+
+# Marqueur d'organisation/école (« Gymnase de Nyon », « Musée d'art et d'histoire »).
+_EMPLOYER_MARKER = (
+    r"Coll[èe]ge|Gymnase|[ÉE]cole|Lyc[ée]e|Cycle d'[Oo]rientation|"
+    r"Universit[ée]|Haute [ÉE]cole|HEP|Institut|Fondation|Mus[ée]e|"
+    r"Biblioth[èe]que|Centre|Association|D[ée]partement|Service"
+)
+# Un « jeton de nom » : mot capitalisé, construction avec apostrophe (« d'art »),
+# ou mot de liaison (de, la, et…). On capture le marqueur + 1 à 5 jetons suivants.
+_NAME_TOKEN = (
+    r"(?:[A-ZÉÈÀÂÎÔ][\wÉÈÀÂÎÔéèàâîôûç’'\-]*"
+    r"|[dlD][’'][a-zéèàâîôûç]+"
+    r"|de|des|du|la|le|les|et|aux|au|à)"
+)
+_EMPLOYER_RE = re.compile(
+    rf"\b({_EMPLOYER_MARKER})\s+({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,4}})",
+    re.UNICODE,
+)
+# Jetons de liaison à rogner en fin de nom (« Université de » → « Université »).
+_TRAILING_CONNECTORS = {"de", "des", "du", "la", "le", "les", "et", "aux", "au", "a"}
+
+
+def is_meaningful_company(company: str) -> bool:
+    """Vrai si `company` désigne un vrai employeur (pas un bouche-trou « — »)."""
+    norm = normalize(company).strip()
+    return len(norm) > 1 and norm not in EMPLOYER_PLACEHOLDERS
+
+
+def extract_employer(text: str) -> str:
+    """Extrait un nom d'organisation/école depuis un texte (best effort).
+
+    Sert de SIGNAL DE DÉDUP : une extraction partielle (« Gymnase de Nyon »)
+    suffit à distinguer deux postes au même intitulé. Retourne "" si rien.
+    """
+    m = _EMPLOYER_RE.search(text or "")
+    if not m:
+        return ""
+    marker, name = m.group(1), re.sub(r"\s+", " ", m.group(2)).strip(" ,;:.")
+    # Rogne les mots de liaison résiduels en fin (« de Genève et » → « de Genève »).
+    words = name.split()
+    while words and normalize(words[-1]) in _TRAILING_CONNECTORS:
+        words.pop()
+    name = " ".join(words)
+    # Garde-fou : un vrai nom propre contient une majuscule ou une apostrophe.
+    # Sinon ce n'est que du remplissage (« Centre de ») → on ignore.
+    if not name or not re.search(r"[A-ZÉÈÀÂÎÔ’']", name):
+        return ""
+    return f"{marker} {name}".strip()
+
+
+def job_employer(job: dict) -> str:
+    """Employeur de référence : `company` si réel, sinon l'école extraite."""
+    company = job.get("company", "")
+    if is_meaningful_company(company):
+        return company
+    return job.get("employer", "")
+
+
+def title_fingerprint(title: str) -> str:
+    """Empreinte d'un titre, insensible à la typographie inclusive et à la ponctuation.
+
+    « Greffier-ère », « Greffier·ère », « Greffier/ère » → même empreinte.
+    Sert à fusionner les ré-publications d'une même offre.
+    """
+    return re.sub(r"[^a-z0-9]+", "", normalize(title))
+
+
+def is_duplicate(job: dict, fp_to_known: dict) -> bool:
+    """Vrai si `job` est un doublon d'une offre déjà retenue.
+
+    Règle (choix utilisateur) : deux offres au même `title_fingerprint` sont des
+    doublons, SAUF si toutes deux ont un employeur CONNU et DIFFÉRENT (cas « deux
+    écoles distinctes au même intitulé », préservé via l'extraction d'employeur).
+
+    `fp_to_known` mappe empreinte → set des employeurs connus déjà retenus.
+    Met à jour `fp_to_known` au passage (enregistre l'offre conservée).
+    """
+    fp = title_fingerprint(job.get("title", ""))
+    emp = normalize(job_employer(job))
+    known = fp_to_known.get(fp)
+    if known is None:
+        fp_to_known[fp] = {emp} if emp else set()
+        return False                       # empreinte jamais vue → on garde
+    if emp and emp not in known:
+        known.add(emp)
+        return False                       # employeur connu et distinct → on garde
+    return True                            # même titre, pas de nouvel employeur → doublon
+
+
+# Zone géographique acceptée : Genève + district de Nyon proche
+GEO_OK = GENEVE_ZONE | VAUD_ZONE
+
+# Lieux explicitement trop loin → rejet immédiat (même si autres indices)
+GEO_FAR = [
+    "lausanne", "morges", "gland", "rolle", "yverdon", "vevey", "montreux",
+    "fribourg", "neuchatel", "neuchâtel", "sion", "valais", "berne", "bern",
+    "zurich", "zürich", "bale", "bâle", "basel", "lucerne", "luzern",
+    "biel", "bienne", "delemont", "delémont", "jura", "aigle", "bulle",
+    "pully", "renens", "vverdon", "winterthur", "saint-gall", "tessin",
+    "lugano", "thoune", "coire", "chur", "schaffhouse", "zoug", "zug",
+]
+
+# Matching « mot entier » des lieux : « sion » (Valais) ne doit pas matcher
+# « expreSSION », ni « bern » matcher « BERNex » (commune genevoise).
+_GEO_FAR_RE = _compile_terms(GEO_FAR, inflect=False)
+_GEO_OK_RE = _compile_terms(GEO_OK, inflect=False)
+
+
+def in_zone(location: str, description: str = "") -> bool:
+    """Vrai si l'offre est dans la zone Genève + Nyon proche.
+
+    Politique : tolérante mais sûre.
+    - Un lieu connu hors-zone (Lausanne, Fribourg…) → rejet.
+    - Un lieu de la zone (Genève, Nyon…) → accepté.
+    - Aucun indice de lieu → accepté par prudence (mieux vaut vérifier une
+      offre de trop qu'en rater une mal étiquetée).
+    """
+    text = normalize(location + " " + description)
+    if term_in(text, _GEO_FAR_RE):
+        return False
+    if term_in(text, _GEO_OK_RE):
+        return True
+    return True            # pas d'indice clair → on garde (à vérifier à l'œil)
+
+
+def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set):
+    """Logique commune : pertinence (titre puis description si ambigu),
+    filtre géographique, enrichissement et ajout.
+
+    base_fields doit contenir au moins company, source, location.
+    """
+    if not title or not url or url in seen_urls:
+        return
+    if not is_french_text(title):
+        log(f"Rejeté (langue non-FR) : {title[:70]}")
+        return
+    description = ""
+    if is_relevant(title):
+        pass                                    # pertinent sur le titre seul
+    elif title_is_ambiguous(title):
+        description = fetch_description(url)     # on lit le détail
+        if not is_relevant(title, description):
+            return
+    else:
+        return
+    # Filtre géographique : on écarte les offres hors zone Genève/Nyon
+    if not in_zone(base_fields.get("location", ""), description):
+        return
+    seen_urls.add(url)
+    job = {
+        "title": title, "url": url,
+        "description": description,
+        "found_at": datetime.now().isoformat(),
+        **base_fields,
+    }
+    jobs.append(finalize(job))
+
+
+# ---------------------------------------------------------------------------
+# Scrapers existants (inchangés sauf intégration de consider/finalize)
 # ---------------------------------------------------------------------------
 
 def scrape_ville_geneve() -> list:
-    """Offres de la Ville de Genève (administration municipale)."""
-    jobs = []
+    """Offres de la Ville de Genève (administration municipale).
+
+    NB : ville-geneve.ch redirige désormais vers geneve.ch. On construit donc
+    les liens de détail sur geneve.ch directement, pour éviter les 404.
+    """
+    jobs, seen_urls = [], set()
     url = (
-        "https://www.ville-geneve.ch/autorites-administration/"
+        "https://www.geneve.ch/autorites-administration/"
         "administration-municipale/travailler-ville-geneve/offres-emploi/"
     )
     soup = fetch(url)
     if not soup:
         return jobs
-
     for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if "/administration-municipale/offres-emploi/" not in href:
+        if "/administration-municipale/offres-emploi/" not in href and "/offres-emploi/" not in href:
             continue
         title = a.get_text(strip=True)
         if not title or len(title) < 5:
             continue
         if not href.startswith("http"):
-            href = "https://www.ville-geneve.ch" + href
-        if is_relevant(title):
-            jobs.append({
-                "title": title, "company": "Ville de Genève", "url": href,
-                "source": "ville-geneve.ch", "location": "Genève",
-                "found_at": datetime.now().isoformat(),
-            })
-
-    jobs = dedup_by_url(jobs)
-    log(f"ville-geneve.ch: {len(jobs)} offre(s) trouvée(s)")
+            href = "https://www.geneve.ch" + href
+        # On force le domaine geneve.ch (ville-geneve.ch renvoie des 404 en détail)
+        href = href.replace("https://www.ville-geneve.ch", "https://www.geneve.ch")
+        consider(title, href,
+                 {"company": "Ville de Genève", "source": "geneve.ch",
+                  "location": "Genève"}, jobs, seen_urls)
+    log(f"geneve.ch (Ville): {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
 def scrape_letemps() -> list:
     """Le Temps Emploi — page de listing."""
-    jobs = []
+    jobs, seen_urls = [], set()
     url = "https://www.letemps.ch/emploi"
     soup = fetch(url)
     if not soup:
         return jobs
-
     for card in soup.select("li.job.card"):
         title_el = card.select_one("h3.job-title > a.stretched-link, a.stretched-link")
         if not title_el:
@@ -385,13 +841,9 @@ def scrape_letemps() -> list:
         company = company_el.get_text(strip=True) if company_el else "—"
         loc_el = card.select_one(".job-location, .location, [data-location]")
         location = loc_el.get_text(strip=True) if loc_el else "Suisse romande"
-        if title and href and is_relevant(title):
-            jobs.append({
-                "title": title, "company": company, "url": href,
-                "source": "Le Temps Emploi", "location": location,
-                "found_at": datetime.now().isoformat(),
-            })
-
+        consider(title, href,
+                 {"company": company, "source": "Le Temps Emploi",
+                  "location": location}, jobs, seen_urls)
     log(f"Le Temps Emploi: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
@@ -423,13 +875,18 @@ def scrape_vaud() -> list:
             loc = job.get("PrimaryLocation", "")
             if not any(z in loc.lower() for z in VAUD_ZONE):
                 continue
+            if not is_french_text(title):
+                log(f"Rejeté (langue non-FR) : {title[:70]}")
+                continue
             if is_relevant(title, short_desc):
-                jobs.append({
+                j = {
                     "title": title, "company": "État de Vaud",
                     "url": f"https://offres-emploi.vd.ch/#fr/job/{jid}",
                     "source": "offres-emploi.vd.ch", "location": loc,
+                    "description": short_desc,
                     "found_at": datetime.now().isoformat(),
-                })
+                }
+                jobs.append(finalize(j))
                 found += 1
         log(f"offres-emploi.vd.ch: {found} offre(s) trouvée(s) sur {len(reqs)} total")
     except Exception as e:
@@ -438,7 +895,12 @@ def scrape_vaud() -> list:
 
 
 def scrape_jobscout24() -> list:
-    """Offres privées via JobScout24.ch."""
+    """Offres privées via JobScout24.ch.
+
+    Sélecteur robuste : on cible directement les liens d'offres par leur motif
+    d'URL (/fr/job/) plutôt que de dépendre du conteneur <li> parent, qui peut
+    changer. Le lieu/entreprise est lu dans le conteneur le plus proche.
+    """
     KEYWORDS_JS24 = [
         "redacteur", "editeur", "bibliothecaire", "libraire", "correcteur",
         "traducteur", "documentaliste", "journaliste", "communication",
@@ -447,7 +909,7 @@ def scrape_jobscout24() -> list:
         "mediation", "charge-de-projet-culturel",
     ]
     BASE = "https://www.jobscout24.ch"
-    jobs, seen_urls, total_found = [], set(), 0
+    jobs, seen_urls = [], set()
     search_configs = [("GE", GENEVE_ZONE), ("VD", VAUD_ZONE)]
 
     for kw in KEYWORDS_JS24:
@@ -461,44 +923,44 @@ def scrape_jobscout24() -> list:
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
-                for item in soup.select("li.job-list-item"):
-                    title_el = item.select_one("a.job-link-detail")
-                    if not title_el:
+                # --- SÉLECTEUR ROBUSTE : liens d'offres par motif d'URL ---
+                links = soup.select("a.job-link-detail, a.job-title, a[href*='/fr/job/']")
+                for link in links:
+                    href = link.get("href", "")
+                    if "/fr/job/" not in href:
                         continue
-                    title = title_el.get_text(strip=True)
-                    href = title_el.get("href", "")
-                    if not href:
+                    title = (link.get("title", "") or link.get_text(strip=True)).strip()
+                    if not title:
                         continue
                     full_url = BASE + href if href.startswith("/") else href
                     if full_url in seen_urls:
                         continue
-                    spans = item.select("p.job-attributes span")
-                    company = spans[0].get_text(strip=True) if len(spans) > 0 else "—"
-                    location = spans[1].get_text(strip=True) if len(spans) > 1 else "—"
-                    if not any(z in location.lower() for z in zone_filter):
-                        continue
-                    if not is_relevant(title):
-                        continue
-                    seen_urls.add(full_url)
-                    jobs.append({
-                        "title": title, "company": company, "url": full_url,
-                        "source": "jobscout24.ch", "location": location or "—",
-                        "found_at": datetime.now().isoformat(),
-                    })
-                    total_found += 1
+                    # Lieu/entreprise : on cherche dans le conteneur parent proche
+                    container = link.find_parent(["li", "article", "div"])
+                    location = "—"
+                    if container:
+                        spans = container.select("p.job-attributes span, .job-location, .location")
+                        if spans:
+                            texts = [s.get_text(strip=True) for s in spans]
+                            # heuristique : le lieu est souvent le 2e attribut
+                            location = texts[1] if len(texts) > 1 else texts[0]
+                    # Le filtre géographique fin est de toute façon dans consider()
+                    consider(title, full_url,
+                             {"company": "—", "source": "jobscout24.ch",
+                              "location": location}, jobs, seen_urls)
             except Exception as e:
                 log(f"Erreur jobscout24 [{kw}/{region_code}]: {e}")
 
-    log(f"jobscout24.ch: {total_found} offre(s) trouvée(s)")
+    _warn_if_empty("jobscout24.ch", jobs)
+    log(f"jobscout24.ch: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
 def scrape_jobup() -> list:
-    """Offres via jobup.ch.
+    """Offres via jobup.ch (HTML server-side).
 
-    ATTENTION : le robots.txt de jobup interdit /api/. Cette fonction parse le
-    HTML server-side. Si jobup charge ses offres via JS/API, ce scraper
-    retournera 0 — dans ce cas, préférer le sitemap public :
+    Si jobup bascule en rendu JS/API (interdit par robots.txt), ce scraper
+    retournera 0 et l'auto-diagnostic le signalera. Repli possible : sitemap
     https://www.jobup.ch/sitemaps/jobup/fr/sitemap.xml
     """
     BASE = "https://www.jobup.ch"
@@ -511,7 +973,7 @@ def scrape_jobup() -> list:
         "médiation culturelle",
     ]
     SEARCH_CONFIGS = [("region=34", None), ("location=nyon", VAUD_ZONE)]
-    jobs, seen_urls, total = [], set(), 0
+    jobs, seen_urls = [], set()
 
     for kw in KEYWORDS_JU:
         for geo_param, zone_filter in SEARCH_CONFIGS:
@@ -544,40 +1006,29 @@ def scrape_jobup() -> list:
                             loc = loc_raw[:60]
                     if zone_filter is not None and not any(z in loc.lower() for z in zone_filter):
                         continue
-                    if not is_relevant(title):
-                        continue
-                    seen_urls.add(full_url)
-                    jobs.append({
-                        "title": title, "company": "—", "url": full_url,
-                        "source": "jobup.ch", "location": loc,
-                        "found_at": datetime.now().isoformat(),
-                    })
-                    total += 1
+                    consider(title, full_url,
+                             {"company": "—", "source": "jobup.ch",
+                              "location": loc}, jobs, seen_urls)
             except Exception as e:
                 log(f"Erreur jobup [{kw}/{geo_param}]: {e}")
 
     _warn_if_empty("jobup.ch", jobs)
-    log(f"jobup.ch: {total} offre(s) trouvée(s)")
+    log(f"jobup.ch: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
 def scrape_adzuna() -> list:
-    """Offres via l'API Adzuna — agrège Indeed, LinkedIn, etc.
-
-    Désactivé silencieusement si les identifiants ne sont pas configurés.
-    """
+    """Offres via l'API Adzuna — agrège Indeed, LinkedIn, etc."""
     if not ADZUNA_ID or not ADZUNA_KEY:
         log("Adzuna : identifiants absents (ADZUNA_ID/ADZUNA_KEY) — source ignorée")
         return []
-
     KEYWORDS_AZ = [
         "rédacteur", "éditeur", "bibliothécaire", "libraire", "correcteur",
         "traducteur", "journaliste", "documentaliste", "professeur français",
         "communication culturelle", "archiviste", "médiateur culturel",
         "chargé de projet culturel",
     ]
-    jobs, seen_urls, total = [], set(), 0
-
+    jobs, seen_urls = [], set()
     for kw in KEYWORDS_AZ:
         url = (
             "https://api.adzuna.com/v1/api/jobs/ch/search/1"
@@ -595,26 +1046,89 @@ def scrape_adzuna() -> list:
             for item in r.json().get("results", []):
                 title = item.get("title", "").strip()
                 link = item.get("redirect_url", "")
-                desc = item.get("description", "")[:300]
+                desc = item.get("description", "")[:600]
                 company = item.get("company", {}).get("display_name", "—")
                 location = item.get("location", {}).get("display_name", "—")
                 dedup_key = urlparse(link).path
                 if not title or not link or dedup_key in seen_urls:
                     continue
+                if not is_french_text(title):
+                    log(f"Rejeté (langue non-FR) : {title[:70]}")
+                    continue
+                if not in_zone(location, desc):
+                    continue
+                # Adzuna fournit déjà une description : on l'exploite directement
                 if not is_relevant(title, desc):
                     continue
                 seen_urls.add(dedup_key)
-                jobs.append({
+                j = {
                     "title": title, "company": company, "url": link,
                     "source": "Adzuna (Indeed+)", "location": location,
+                    "description": desc,
                     "found_at": datetime.now().isoformat(),
-                })
-                total += 1
+                }
+                jobs.append(finalize(j))
         except Exception as e:
             log(f"Adzuna [{kw}]: {e}")
-
-    log(f"Adzuna: {total} offre(s) trouvée(s)")
+    log(f"Adzuna: {len(jobs)} offre(s) trouvée(s)")
     return jobs
+
+
+# --- Script d'init « furtif » : masque les marqueurs d'automatisation que les
+# murs anti-bot (myScience /bot_score, DataDome d'Indeed…) inspectent. ---
+_STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => false});
+Object.defineProperty(navigator, 'languages', {get: () => ['fr-CH', 'fr']});
+Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+window.chrome = window.chrome || {runtime: {}};
+"""
+
+
+def _new_stealth_context(browser):
+    """Crée un contexte Chromium réaliste + furtif (réutilisé par plusieurs sources)."""
+    ctx = browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 900},
+        locale="fr-CH",
+        timezone_id="Europe/Zurich",
+    )
+    ctx.add_init_script(_STEALTH_INIT_JS)
+    return ctx
+
+
+def fetch_via_playwright(url: str, wait_selector: str = None):
+    """Charge une page derrière un mur JS via un Chromium furtif.
+
+    Laisse le vrai navigateur exécuter le défi anti-bot (ex. POST /bot_score de
+    myScience) puis renvoie le HTML rendu sous forme de BeautifulSoup.
+    Retourne None si Chromium est indisponible ou en cas d'échec.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
+    try:
+        with _sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                executable_path=_CHROMIUM_PATH, headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            ctx = _new_stealth_context(browser)
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=25000)
+                if wait_selector:
+                    try:
+                        page.wait_for_selector(wait_selector, timeout=8000)
+                    except Exception:
+                        pass            # le défi a pu rediriger sans ce sélecteur
+                else:
+                    page.wait_for_timeout(4000)
+                html = page.content()
+            finally:
+                browser.close()
+        return BeautifulSoup(html, "lxml")
+    except Exception as e:
+        log(f"Erreur fetch_via_playwright {url}: {e}")
+        return None
 
 
 INDEED_QUERIES = [
@@ -626,21 +1140,17 @@ INDEED_QUERIES = [
 
 
 def scrape_indeed_pw() -> list:
-    """Offres Indeed CH via Playwright. Nécessite un Chromium système."""
+    """Offres Indeed CH via Playwright. Nécessite un Chromium système (apt)."""
     if not PLAYWRIGHT_AVAILABLE:
-        log("Indeed : Chromium système introuvable — source ignorée (sudo snap install chromium)")
+        log("Indeed : Chromium système introuvable — source ignorée (sudo apt install chromium-browser)")
         return []
-
-    jobs, seen_urls, total = [], set(), 0
+    jobs, seen_urls = [], set()
     with _sync_playwright() as pw:
         browser = pw.chromium.launch(
             executable_path=_CHROMIUM_PATH, headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"],
         )
-        ctx = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 900}, locale="fr-CH",
-        )
+        ctx = _new_stealth_context(browser)      # contexte furtif partagé
         page = ctx.new_page()
         for term, loc in INDEED_QUERIES:
             url = f"https://ch-fr.indeed.com/emplois?q={quote(term)}&l={quote(loc)}&radius=30"
@@ -665,32 +1175,63 @@ def scrape_indeed_pw() -> list:
                     if full_url in seen_urls:
                         continue
                     location = loc_el.get_text(strip=True) if loc_el else "Genève"
+                    if not is_french_text(title):
+                        log(f"Rejeté (langue non-FR) : {title[:70]}")
+                        continue
                     if not is_relevant(title):
                         continue
                     seen_urls.add(full_url)
-                    jobs.append({
+                    j = {
                         "title": title, "company": "—", "url": full_url,
                         "source": "Indeed CH", "location": location,
+                        "description": "",
                         "found_at": datetime.now().isoformat(),
-                    })
-                    total += 1
+                    }
+                    jobs.append(finalize(j))
             except Exception as e:
                 log(f"Indeed PW [{term}]: {e}")
             time.sleep(2)
         browser.close()
-
-    log(f"Indeed CH (Playwright): {total} offre(s) trouvée(s)")
+    log(f"Indeed CH (Playwright): {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
+# Établissement employeur sur la page de détail ge.ch : « Lieu de travail
+# <établissement> Postuler ». SÉLECTEUR À AJUSTER SI BESOIN.
+_GE_LIEU_RE = re.compile(
+    r"Lieu de travail\s+(.+?)\s+(?:Postuler|Type de publication)\b", re.S)
+
+
+def _ge_ch_etablissement(href: str) -> str:
+    """Établissement (« École de commerce Nicolas-Bouvier ») depuis la page de détail.
+
+    Sert de SIGNAL DE DÉDUP : deux postes au même intitulé mais dans deux écoles
+    différentes de l'État de Genève doivent rester distincts. Retourne "" si rien.
+    """
+    soup = fetch(href, retries=2)
+    if not soup:
+        return ""
+    m = _GE_LIEU_RE.search(soup.get_text(" ", strip=True))
+    if not m:
+        return ""
+    name = re.sub(r"[\s​]+", " ", m.group(1)).strip(" ,;:.​")
+    return name if 1 < len(name) <= 80 else ""
+
+
 def scrape_ge_ch() -> list:
-    """Offres de l'État de Genève."""
-    jobs = []
+    """Offres de l'État de Genève.
+
+    Chaque offre RETENUE est ensuite rattachée à son établissement (lu sur la page
+    de détail) : sans cela, deux postes distincts au même intitulé générique
+    (« … / Français ») sont fusionnés à tort par la dédup, faute d'employeur
+    distinctif. L'enrichissement se fait après le filtrage pour ne lire que les
+    pages des offres pertinentes (la liste brute compte ~40 articles).
+    """
+    jobs, seen_urls = [], set()
     url = "https://www.ge.ch/offres-emploi-etat-geneve/liste-offres"
     soup = fetch(url)
     if not soup:
         return jobs
-
     for article in soup.select("article"):
         title_el = (
             article.select_one("div.text-title-medium a")
@@ -703,44 +1244,303 @@ def scrape_ge_ch() -> list:
         href = title_el.get("href", "")
         if href and not href.startswith("http"):
             href = "https://www.ge.ch" + href
-        if title and href and is_relevant(title):
-            jobs.append({
-                "title": title, "company": "État de Genève", "url": href,
-                "source": "ge.ch", "location": "Genève",
-                "found_at": datetime.now().isoformat(),
-            })
-
+        consider(title, href,
+                 {"company": "État de Genève", "source": "ge.ch",
+                  "location": "Genève"}, jobs, seen_urls)
+    # Employeur distinctif (= établissement) sur les seules offres retenues.
+    for job in jobs:
+        etab = _ge_ch_etablissement(job["url"])
+        if etab:
+            job["company"] = f"État de Genève — {etab}"
     log(f"ge.ch: {len(jobs)} offre(s) trouvée(s)")
     return jobs
+
+
+# ---------------------------------------------------------------------------
+# NOUVEAUX SCRAPERS (point 2)
+# Sélecteurs « best effort » : isolés en tête de fonction, faciles à ajuster.
+# Si une source renvoie 0, l'auto-diagnostic le signale dans les logs.
+# ---------------------------------------------------------------------------
+
+def scrape_unige() -> list:
+    """Postes vacants de l'Université de Genève (jobs.unige.ch).
+
+    Le portail « wd_portal » liste les postes par date. On essaie plusieurs
+    URLs car le paramétrage exact varie. Les liens de détail pointent vers
+    wd_portal.show_job (ou variantes).
+    """
+    jobs, seen_urls = [], set()
+    # Plusieurs variantes d'URL de résultats (le portail accepte différents jeux
+    # de paramètres ; on tente la plus simple puis une plus complète).
+    urls = [
+        "https://jobs.unige.ch/www/wd_portal.list?p_web_site_id=1",
+        ("https://jobs.unige.ch/www/wd_portal.search_results"
+         "?p_web_site_id=1&p_category_id=1&p_show_results=Y"
+         "&p_form_type=CHECKBOX&p1=51&p1_val=Any&p2=46&p2_val=Any"
+         "&p_text=&p_save_search=N"),
+    ]
+    for url in urls:
+        soup = fetch(url)
+        if not soup:
+            continue
+        # --- SÉLECTEUR À AJUSTER SI BESOIN ---
+        candidates = soup.select(
+            "a[href*='show_job'], a[href*='wd_portal'], "
+            "table a[href], li a[href]"
+        )
+        for a in candidates:
+            title = a.get_text(strip=True)
+            href = a.get("href", "")
+            # On écarte les liens de navigation du portail
+            if not title or len(title) < 8 or not href:
+                continue
+            low = title.lower()
+            if any(skip in low for skip in ("recherche", "connexion", "retour",
+                                            "accueil", "english", "imprimer")):
+                continue
+            full_url = urljoin("https://jobs.unige.ch/www/", href)
+            consider(title, full_url,
+                     {"company": "Université de Genève", "source": "jobs.unige.ch",
+                      "location": "Genève"}, jobs, seen_urls)
+        if jobs:
+            break          # une URL a fonctionné, inutile de tenter la suivante
+    _warn_if_empty("jobs.unige.ch", jobs)
+    log(f"jobs.unige.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_myscience() -> list:
+    """Postes académiques de TOUTES les universités suisses via myscience.ch.
+
+    Couvre UNIGE, UNIL, EPFL, etc. d'un coup. On filtre sur la zone lémanique
+    et la pertinence Lettres. Source précieuse car centralisée.
+    """
+    jobs, seen_urls = [], set()
+    # Le portail liste les annonces par CATÉGORIE (et non par ?search=, qui
+    # renvoie 404). On parcourt les catégories proches des Lettres Modernes ;
+    # la pertinence fine reste filtrée par consider().
+    categories = [
+        "Linguistics-Literature", "Education", "Pedagogy", "Art-Design",
+        "History-Archeology", "Media", "Philosophy", "Social+Sciences",
+    ]
+    for cat in categories:
+        url = f"https://www.myscience.ch/fr/jobs/{cat}"
+        # myScience sert un mur anti-bot JS (« Security check » → /bot_score) :
+        # un simple requests ne voit jamais la liste. On passe par un Chromium
+        # furtif qui exécute le défi puis rend le HTML réel.
+        soup = fetch_via_playwright(url, wait_selector="a[href*='/jobs/id']")
+        if not soup:
+            continue
+        # Les vraies annonces ont le motif /jobs/id<NNNNN>-… et sont balisées en
+        # microdata schema.org : titre = span[itemprop=name], lieu = span.location.
+        for a in soup.select("a[href*='/jobs/id']"):
+            href = a.get("href", "")
+            title_el = a.select_one("span[itemprop='name'], .results_title")
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not title or len(title) < 6 or not href:
+                continue
+            loc_el = a.select_one("span.location, .results_location")
+            location = loc_el.get_text(strip=True) if loc_el else "Suisse"
+            org_el = a.select_one(".results_organization")
+            company = org_el.get_text(strip=True) if org_el else "Université (myScience)"
+            full_url = urljoin("https://www.myscience.ch", href)
+            consider(title, full_url,
+                     {"company": company, "source": "myscience.ch",
+                      "location": location}, jobs, seen_urls)
+    _warn_if_empty("myscience.ch", jobs)
+    log(f"myscience.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_museums() -> list:
+    """Offres d'emploi dans les musées suisses (museums.ch / ICOM Suisse).
+
+    Publication gratuite, accès propre. Cœur de cible pour médiation/édition/
+    conservation. Les offres sont sous /portail-de-lemploi/<titre>-<id>.html
+    """
+    jobs, seen_urls = [], set()
+    # Vraie URL du portail de l'emploi (et non l'URL inventée précédente)
+    url = "https://www.museums.ch/fr/espace-professionnel/offres/portail-de-lemploi-3036.html"
+    soup = fetch(url)
+    if not soup:
+        _warn_if_empty("museums.ch", jobs)
+        return jobs
+    # --- SÉLECTEUR À AJUSTER SI BESOIN ---
+    # Les annonces sont des liens vers .../portail-de-lemploi/...-NNNN.html
+    candidates = soup.select("a[href*='portail-de-lemploi/']")
+    if not candidates:
+        candidates = soup.select("article a[href], h2 a[href], h3 a[href], li a[href]")
+    for a in candidates:
+        href = a.get("href", "")
+        if not href:
+            continue
+        # Chercher d'abord un titre court dans les enfants de l'ancre
+        heading = a.select_one("h2, h3, h4, strong, span.title")
+        raw = heading.get_text(strip=True) if heading else a.get_text(strip=True)
+        # Supprimer le préfixe "Publié le: JJ.MM.AAAA" injecté par le CMS
+        title = re.sub(r'^Publié\s+le\s*:\s*\d{2}\.\d{2}\.\d{4}', '', raw).strip()
+        title = title.split("\n")[0].strip()  # première ligne seulement
+        if not title or len(title) < 6 or len(title) > 150:
+            continue
+        full_url = urljoin("https://www.museums.ch/", href)
+        consider(title, full_url,
+                 {"company": "Musée (museums.ch)", "source": "museums.ch",
+                  "location": "Suisse"}, jobs, seen_urls)
+    _warn_if_empty("museums.ch", jobs)
+    log(f"museums.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+# Portail emploi enseignant. job.educa.ch est HORS LIGNE depuis 2025 : le
+# sous-domaine ne résout plus dans le DNS mondial (NXDOMAIN, vérifié via
+# dns.google). Grâce au fail-fast de fetch(), un échec DNS ne coûte plus qu'une
+# ligne de log. Dès qu'un portail successeur est connu, repointer ici (1 ligne).
+EDUCA_URLS = [
+    "https://job.educa.ch/fr/recherche",
+    "https://job.educa.ch/fr",
+]
+
+
+def scrape_educa() -> list:
+    """Offres d'enseignement via le portail officiel du corps enseignant suisse.
+
+    Source conservée mais actuellement injoignable (voir EDUCA_URLS). Renvoie 0
+    proprement et sans pénalité de temps tant qu'aucun successeur n'est repointé.
+    """
+    jobs, seen_urls = [], set()
+    reachable = False
+    for url in EDUCA_URLS:
+        # job.educa.ch est hors-ligne (NXDOMAIN). Si le host ne résout pas, on
+        # saute SANS fetch ni log d'erreur : la source reste en sommeil, prête à
+        # reprendre dès que le DNS répond ou qu'on repointe EDUCA_URLS.
+        if not host_resolves(url):
+            continue
+        reachable = True
+        soup = fetch(url)
+        if not soup:
+            continue
+        # --- SÉLECTEUR À AJUSTER SI BESOIN ---
+        candidates = soup.select(
+            "a[href*='/offre'], a[href*='/job'], a[href*='/stelle'], "
+            "article a[href], .views-row a[href], li a[href], h2 a[href], h3 a[href]"
+        )
+        for a in candidates:
+            title = a.get_text(strip=True)
+            href = a.get("href", "")
+            if not title or len(title) < 6 or not href:
+                continue
+            full_url = urljoin("https://job.educa.ch/", href)
+            consider(title, full_url,
+                     {"company": "École (educa.Job)", "source": "job.educa.ch",
+                      "location": "Suisse"}, jobs, seen_urls)
+        if jobs:
+            break
+    # Tant que le portail est injoignable, on reste totalement silencieux.
+    if reachable:
+        _warn_if_empty("job.educa.ch", jobs)
+        log(f"job.educa.ch: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_educh() -> list:
+    """DÉSACTIVÉ : le robots.txt d'educh.ch interdit le scraping de /emploi/.
+
+    Conservée à titre documentaire mais retirée du registre SCRAPERS. Ne pas
+    réactiver sans vérifier que les CGU et le robots.txt l'autorisent.
+    """
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Auto-diagnostic de santé des sources (point 4)
+# ---------------------------------------------------------------------------
+
+def load_health() -> dict:
+    if HEALTH_FILE.exists():
+        try:
+            return json.loads(HEALTH_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_health(health: dict):
+    HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+
+
+# Sources connues comme dormantes (domaine hors-ligne / mur anti-bot persistant).
+# On continue de suivre leur santé, mais sans émettre d'alerte de bruit tant
+# qu'on ne les a pas réparées/repointées (elles restent dans SCRAPERS).
+HEALTH_SILENT_SOURCES = {"educa", "indeed_pw"}
+
+
+def update_health(source: str, count: int, health: dict) -> list:
+    """Met à jour l'historique et renvoie des alertes si une source dégénère.
+
+    Alerte si une source qui ramenait >0 en moyenne tombe à 0.
+    """
+    alerts = []
+    entry = health.get(source, {"runs": 0, "total": 0, "last": None, "max": 0})
+    avg_before = (entry["total"] / entry["runs"]) if entry["runs"] else 0
+    entry["runs"] += 1
+    entry["total"] += count
+    entry["last"] = count
+    entry["max"] = max(entry["max"], count)
+    health[source] = entry
+    if source in HEALTH_SILENT_SOURCES:
+        return alerts          # suivi conservé, mais pas d'alerte (source en sommeil)
+    # Détection de panne : la source produisait régulièrement, et tombe à 0
+    if count == 0 and entry["max"] >= 1 and avg_before >= 0.5 and entry["runs"] > 2:
+        alerts.append(
+            f"🚨 {source} : 0 offre alors que la moyenne historique était "
+            f"{avg_before:.1f} (max {entry['max']}). Sélecteur probablement cassé."
+        )
+    # Source chroniquement muette : n'a JAMAIS rien produit malgré plusieurs runs
+    elif entry["max"] == 0 and entry["runs"] >= 5:
+        alerts.append(
+            f"🔇 {source} : 0 offre depuis {entry['runs']} runs (jamais aucun "
+            f"résultat) — à déboguer ou repointer."
+        )
+    return alerts
 
 
 # ---------------------------------------------------------------------------
 # Alertes email
 # ---------------------------------------------------------------------------
 
-def send_alert(new_jobs: list):
-    """Envoie un récapitulatif par email si de nouvelles offres ont été trouvées."""
-    if not new_jobs or not SMTP_PASS or not SMTP_FROM or not SMTP_TO:
+def send_alert(new_jobs: list, health_alerts: list):
+    """Envoie un récapitulatif par email : nouvelles offres + alertes de panne."""
+    if (not new_jobs and not health_alerts) or not SMTP_PASS or not SMTP_FROM or not SMTP_TO:
         return
-    body = "\n".join(
-        f"- {j['title']} ({j.get('source', '?')})\n  {j['url']}"
-        for j in new_jobs
-    )
-    msg = MIMEText(f"{len(new_jobs)} nouvelle(s) offre(s) :\n\n{body}")
-    msg["Subject"] = f"[find_job] {len(new_jobs)} nouvelle(s) offre(s)"
+    parts = []
+    if new_jobs:
+        parts.append(f"{len(new_jobs)} nouvelle(s) offre(s) :\n")
+        for j in sorted(new_jobs, key=lambda x: x.get("score", 0), reverse=True):
+            taux = f" [{j['taux']}]" if j.get("taux") else ""
+            parts.append(f"- ({j.get('score',0)} pts){taux} {j['title']} "
+                         f"({j.get('source','?')})\n  {j['url']}")
+    if health_alerts:
+        parts.append("\n--- Alertes techniques ---")
+        parts.extend(health_alerts)
+    msg = MIMEText("\n".join(parts))
+    subject = f"[find_job] {len(new_jobs)} offre(s)"
+    if health_alerts:
+        subject += f" + {len(health_alerts)} alerte(s)"
+    msg["Subject"] = subject
     msg["From"] = SMTP_FROM
     msg["To"] = SMTP_TO
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(SMTP_FROM, SMTP_PASS)
             s.send_message(msg)
-        log(f"Email envoyé : {len(new_jobs)} offre(s) → {SMTP_TO}")
+        log(f"Email envoyé → {SMTP_TO}")
     except Exception as e:
         log(f"Erreur email : {e}")
 
 
 # ---------------------------------------------------------------------------
-# Rapport HTML (toutes les valeurs dynamiques sont échappées)
+# Rapport HTML (toutes les valeurs dynamiques sont échappées) + tri par score
 # ---------------------------------------------------------------------------
 
 def generate_html(new_jobs: list, all_jobs: list):
@@ -750,47 +1550,57 @@ def generate_html(new_jobs: list, all_jobs: list):
         out = ""
         for j in job_list:
             found = escape(j["found_at"][:16].replace("T", " "))
+            taux = escape(j.get("taux", "") or "—")
+            score = j.get("score", 0)
             out += (
                 f'<tr class="{escape(css_class)}">'
                 f'<td><a href="{escape(j["url"])}" target="_blank" rel="noopener">'
                 f'{escape(j["title"])}</a></td>'
-                f'<td>{escape(j.get("company", "—"))}</td>'
+                f'<td>{escape(job_employer(j) or "—")}</td>'
                 f'<td>{escape(j.get("location", "—"))}</td>'
+                f'<td>{taux}</td>'
                 f'<td>{escape(j["source"])}</td>'
+                f'<td style="text-align:center">{score}</td>'
                 f'<td>{found}</td>'
                 f'</tr>\n'
             )
         return out
 
+    header = ('<table><thead><tr><th>Poste</th><th>Entreprise</th><th>Lieu</th>'
+              '<th>Taux</th><th>Source</th><th>Score</th><th>Trouvé le</th>'
+              '</tr></thead>')
+
+    new_sorted = sorted(new_jobs, key=lambda x: x.get("score", 0), reverse=True)
     section_new = (
         "<p>Aucune nouvelle offre depuis la dernière recherche.</p>"
         if not new_jobs else
-        ('<table><thead><tr><th>Poste</th><th>Entreprise</th><th>Lieu</th>'
-         '<th>Source</th><th>Trouvé le</th></tr></thead>'
-         f'<tbody>{rows(new_jobs, "new")}</tbody></table>')
+        f'{header}<tbody>{rows(new_sorted, "new")}</tbody></table>'
     )
 
-    sorted_all = sorted(all_jobs, key=lambda x: x["found_at"], reverse=True)
+    # Tri principal : score décroissant, puis date décroissante
+    all_sorted = sorted(all_jobs,
+                        key=lambda x: (x.get("score", 0), x["found_at"]),
+                        reverse=True)
     section_all = (
         "<p>Aucune offre trouvée.</p>"
         if not all_jobs else
-        ('<table><thead><tr><th>Poste</th><th>Entreprise</th><th>Lieu</th>'
-         '<th>Source</th><th>Trouvé le</th></tr></thead>'
-         f'<tbody>{rows(sorted_all)}</tbody></table>')
+        f'{header}<tbody>{rows(all_sorted)}</tbody></table>'
     )
 
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Offres d'emploi – Lettres Modernes – Genève</title>
 <style>
-  body {{ font-family: Arial, sans-serif; max-width: 1100px; margin: 2rem auto; color: #222; }}
+  body {{ font-family: Arial, sans-serif; max-width: 1200px; margin: 2rem auto;
+          color: #222; padding: 0 1rem; }}
   h1 {{ color: #1a56db; }}
   h2 {{ margin-top: 2rem; border-bottom: 2px solid #e5e7eb; padding-bottom: .5rem; }}
-  table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
-  th {{ background: #1a56db; color: white; padding: .6rem 1rem; text-align: left; }}
-  td {{ padding: .5rem 1rem; border-bottom: 1px solid #e5e7eb; }}
+  table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: .95rem; }}
+  th {{ background: #1a56db; color: white; padding: .6rem .8rem; text-align: left; }}
+  td {{ padding: .5rem .8rem; border-bottom: 1px solid #e5e7eb; }}
   tr.new td {{ background: #fefce8; }}
   tr:hover td {{ background: #f0f9ff; }}
   a {{ color: #1a56db; text-decoration: none; }}
@@ -802,7 +1612,7 @@ def generate_html(new_jobs: list, all_jobs: list):
 </head>
 <body>
 <h1>Offres d'emploi – Lettres Modernes – Genève</h1>
-<p class="updated">Dernière mise à jour : {now}</p>
+<p class="updated">Dernière mise à jour : {now} · Tri par score de pertinence</p>
 
 <h2>Nouvelles offres <span class="badge">{len(new_jobs)}</span></h2>
 {section_new}
@@ -817,8 +1627,41 @@ def generate_html(new_jobs: list, all_jobs: list):
     log(f"Rapport HTML mis à jour : {RESULTS_FILE}")
 
 
+def generate_rss(all_jobs: list):
+    """Génère un flux RSS des offres (bonus, lisible en agrégateur/mobile)."""
+    recent = sorted(all_jobs, key=lambda x: x["found_at"], reverse=True)[:50]
+    items = ""
+    for j in recent:
+        title = escape(j["title"])
+        link = escape(j["url"])
+        src = escape(j.get("source", ""))
+        loc = escape(j.get("location", ""))
+        try:
+            pub_dt = datetime.fromisoformat(j["found_at"])
+        except (KeyError, ValueError):
+            pub_dt = datetime.now()
+        pub_date = pub_dt.strftime("%a, %d %b %Y %H:%M:%S +0000")
+        items += (
+            f"<item><title>{title}</title><link>{link}</link>"
+            f"<pubDate>{pub_date}</pubDate>"
+            f"<description>{loc} — {src}</description>"
+            f"<guid isPermaLink='false'>{escape(job_id(j['title'], j['url']))}</guid>"
+            f"</item>\n"
+        )
+    rss = (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<rss version='2.0'><channel>"
+        "<title>Offres Lettres Modernes – Genève</title>"
+        "<link>https://gabigbarig.github.io/find_job/</link>"
+        "<description>Veille d'offres d'emploi</description>\n"
+        f"{items}"
+        "</channel></rss>"
+    )
+    RSS_FILE.write_text(rss, encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
-# Main
+# Persistance des offres
 # ---------------------------------------------------------------------------
 
 def load_all_jobs() -> list:
@@ -837,8 +1680,16 @@ def save_all_jobs(jobs: list):
 
 # Chaque scraper est isolé : s'il plante, les autres continuent.
 SCRAPERS = [
-    scrape_ville_geneve, scrape_letemps, scrape_ge_ch, scrape_vaud,
-    scrape_jobscout24, scrape_jobup, scrape_indeed_pw, scrape_adzuna,
+    # Public / para-public
+    scrape_ville_geneve, scrape_ge_ch, scrape_vaud,
+    # Universités & recherche (NOUVEAU)
+    scrape_unige, scrape_myscience,
+    # Culture / enseignement spécialisés (NOUVEAU)
+    scrape_museums, scrape_educa,
+    # Presse / privé
+    scrape_letemps, scrape_jobscout24, scrape_jobup,
+    # Agrégateurs
+    scrape_indeed_pw, scrape_adzuna,
 ]
 
 
@@ -846,35 +1697,90 @@ def main():
     log("=== Démarrage de la recherche d'emploi ===")
     seen = load_seen()
     all_jobs = load_all_jobs()
+    health = load_health()
     all_jobs, seen = expire_old_jobs(all_jobs, seen)
+    before = len(all_jobs)
+    all_jobs = [j for j in all_jobs if is_french_text(j.get("title", ""))]
+    removed = before - len(all_jobs)
+    if removed:
+        log(f"Nettoyage : {removed} offre(s) non-francophone(s) retirée(s) de l'archive")
+
+    # Ré-validation de l'archive avec les filtres ACTUELS (pertinence, zone, score).
+    # Purge les entrées captées sous d'anciennes règles (FLE, labo, hors-zone…).
+    # On recalcule le score car les listes de mots-clés ont pu changer.
+    before = len(all_jobs)
+    revalidated = []
+    for j in all_jobs:
+        j["score"] = relevance_score(j["title"], j.get("description", ""))
+        if passes_filters(j):
+            revalidated.append(j)
+    all_jobs = revalidated
+    purged = before - len(all_jobs)
+    if purged:
+        log(f"Ré-validation : {purged} offre(s) archivée(s) désormais hors critères retirée(s)")
 
     raw = []
+    health_alerts = []
     for scraper in SCRAPERS:
+        source_name = scraper.__name__.replace("scrape_", "")
         try:
-            raw.extend(scraper())
+            results = scraper()
+            raw.extend(results)
+            health_alerts.extend(update_health(source_name, len(results), health))
         except Exception as e:
             log(f"⚠️  {scraper.__name__} a échoué : {e}")
+            health_alerts.extend(update_health(source_name, 0, health))
 
-    # Déduplication par ID (titre+URL) ET par (titre+entreprise)
-    seen_tc = {
-        f"{j['title'].lower().strip()}|{j.get('company', '').lower().strip()}"
-        for j in all_jobs
-    }
+    # Nouvelles offres : enrichissement employeur + même gate de pertinence.
     new_jobs = []
     for job in raw:
         jid = job_id(job["title"], job["url"])
-        tc_key = f"{job['title'].lower().strip()}|{job.get('company', '').lower().strip()}"
-        if jid not in seen and tc_key not in seen_tc:
-            seen.add(jid)
-            seen_tc.add(tc_key)
-            new_jobs.append(job)
-            all_jobs.append(job)
+        if jid in seen:
+            continue                # déjà vu à l'identique : inutile d'enrichir
+        # Enrichissement employeur : si la source n'a pas donné d'employeur, on
+        # lit la page de détail pour en extraire l'école/organisation. Fait ici
+        # (et pas avant) pour ne fetcher que les offres réellement nouvelles.
+        if not is_meaningful_company(job.get("company", "")):
+            desc = job.get("description", "") or fetch_employer_page(job["url"])
+            job["description"] = desc
+            emp = extract_employer(f"{job.get('title', '')} {desc}")
+            if emp:
+                job["employer"] = emp
+        finalize(job)
+        if not passes_filters(job):
+            continue
+        seen.add(jid)
+        job["_new"] = True
+        new_jobs.append(job)
 
-    log(f"Nouvelles offres : {len(new_jobs)} | Total cumulé : {len(all_jobs)}")
+    # Fusion des doublons sur (archive + nouvelles offres). On traite les offres
+    # à employeur CONNU d'abord (canoniques, absorbent les variantes sans
+    # employeur), puis par ordre d'ancienneté. Deux écoles distinctes au même
+    # intitulé restent séparées (employeurs connus différents).
+    combined = sorted(
+        all_jobs + new_jobs,
+        key=lambda j: (0 if job_employer(j) else 1, j.get("found_at", "")),
+    )
+    fp_to_known: dict = {}
+    deduped = [j for j in combined if not is_duplicate(j, fp_to_known)]
+    merged = len(combined) - len(deduped)
+    if merged:
+        log(f"Fusion doublons : {merged} offre(s) en double regroupée(s)")
+    all_jobs = deduped
+    new_jobs = [j for j in deduped if j.pop("_new", False)]
+
+    log(f"Nouvelles offres : {len(new_jobs)} | Total cumulé : {len(all_jobs)} "
+        f"| Pages de détail lues : {_detail_fetch_count} "
+        f"| Pages employeur lues : {_employer_fetch_count}")
+    for alert in health_alerts:
+        log(alert)
+
     save_seen(seen)
     save_all_jobs(all_jobs)
+    save_health(health)
     generate_html(new_jobs, all_jobs)
-    send_alert(new_jobs)
+    generate_rss(all_jobs)
+    send_alert(new_jobs, health_alerts)
     log("=== Recherche terminée ===\n")
 
 
