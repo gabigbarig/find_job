@@ -518,6 +518,27 @@ def fetch(url: str, retries: int = 3):
     return None
 
 
+def url_is_dead(url: str) -> bool:
+    """Vrai si l'URL renvoie 404/410 (offre retirée par la source).
+
+    TOLÉRANT par principe : tout autre cas (200, 3xx, 403, timeout, domaine
+    injoignable, erreur réseau) est considéré « vivant » — on ne purge jamais une
+    offre sur un simple aléa transitoire (mieux vaut un lien douteux qu'en perdre
+    un valide). Sert à retirer de l'archive les liens devenus morts.
+    """
+    if not host_resolves(url):
+        return False
+    try:
+        _polite_wait(url)
+        r = SESSION.head(url, timeout=10, allow_redirects=True)
+        if r.status_code == 405:           # HEAD refusé : on retente en GET léger
+            _polite_wait(url)
+            r = SESSION.get(url, timeout=15)
+        return r.status_code in (404, 410)
+    except Exception:
+        return False
+
+
 # --- Compteurs globaux de fetches de détail (garde-fous séparés) ---
 _detail_fetch_count = 0      # lecture des titres ambigus (consider)
 _employer_fetch_count = 0    # extraction de l'employeur (déduplication)
@@ -1718,6 +1739,20 @@ def main():
     purged = before - len(all_jobs)
     if purged:
         log(f"Ré-validation : {purged} offre(s) archivée(s) désormais hors critères retirée(s)")
+
+    # Purge des liens morts : une offre dont la page renvoie 404/410 a été retirée
+    # par la source et ne doit plus figurer dans le rapport (lien cassé).
+    before = len(all_jobs)
+    all_jobs = [j for j in all_jobs if not url_is_dead(j["url"])]
+    dead = before - len(all_jobs)
+    if dead:
+        log(f"Liens morts : {dead} offre(s) retirée(s) (page 404/410)")
+
+    # Réconciliation `seen` ↔ archive : une offre sortie de `all_jobs` (fusion,
+    # expiration, ré-validation, lien mort) ne doit PAS rester « déjà vue », sinon
+    # `if jid in seen: continue` l'empêcherait de réapparaître même redevenue
+    # pertinente ou distincte (cas des doublons mal fusionnés réintroduits depuis).
+    seen = {job_id(j["title"], j["url"]) for j in all_jobs}
 
     raw = []
     health_alerts = []
