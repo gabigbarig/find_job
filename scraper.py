@@ -1345,6 +1345,11 @@ def scrape_jobs_ch_pw() -> list:
     Plus gros board suisse, mais protégé (Cloudflare) et recouvrant largement
     jobscout24 (même groupe JobCloud — la fusion des doublons par titre+employeur
     regroupe les annonces communes). Nécessite un Chromium système.
+
+    NB : jobs.ch fait de la recherche *sémantique* — une requête niche (ex.
+    « bibliothécaire ») ramène aussi des offres voisines hors-sujet, écartées
+    par is_relevant(). Un total de 0 sur un run = aucune offre Lettres en zone
+    ce jour-là, PAS un sélecteur cassé (vérifié : les cartes se parsent bien).
     """
     if not PLAYWRIGHT_AVAILABLE:
         log("jobs.ch : Chromium système introuvable — source ignorée")
@@ -1368,7 +1373,20 @@ def scrape_jobs_ch_pw() -> list:
                 except Exception:
                     pass
                 soup = BeautifulSoup(page.content(), "lxml")
-                for a in soup.find_all("a", href=True):
+                # jobs.ch = SPA React : chaque résultat est une carte
+                # data-cy="serp-item" contenant un lien data-cy="job-link".
+                # Ces hooks de test sont stables ; repli sur les anciennes
+                # ancres /offres-emplois/detail/ si jobs.ch les retire.
+                # SÉLECTEUR À AJUSTER SI BESOIN.
+                cards = soup.select('[data-cy="serp-item"]')
+                if not cards:
+                    cards = soup.select('a[href*="/offres-emplois/detail/"]')
+                for card in cards:
+                    a = (card.select_one('a[data-cy="job-link"]')
+                         or (card if card.name == "a"
+                             else card.select_one('a[href*="/offres-emplois/detail/"]')))
+                    if not a or not a.get("href"):
+                        continue
                     href = a["href"]
                     if "/offres-emplois/detail/" not in href:
                         continue
@@ -1384,6 +1402,8 @@ def scrape_jobs_ch_pw() -> list:
                         log(f"Rejeté (langue non-FR) : {title[:70]}")
                         continue
                     if not is_relevant(title) or is_fle(title):
+                        continue
+                    if not in_zone(location):
                         continue
                     seen_urls.add(full_url)
                     j = {
@@ -1656,6 +1676,16 @@ _EDUCH_CONTRACT_RE = re.compile(
     r"^(CDI|CDD|Permanent|Temporaire|Stage|Auxiliaire|Mission|Apprentissage|"
     r"Fixe|Int[ée]rim|Temps\s+partiel|Temps\s+plein)\b\s*", re.I)
 
+# Les listes educh préfixent chaque libellé d'une date relative ou absolue
+# (« il y a 2 heures », « 11 juin »…) ; on la retire avant d'isoler le titre.
+_EDUCH_MONTHS = ("janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|"
+                 "septembre|octobre|novembre|décembre|decembre")
+_EDUCH_DATE_PREFIX_RE = re.compile(
+    rf"^\s*(?:il\s+y\s+a\s+\d+\s+(?:minute|heure|jour|semaine|mois|an|année)s?"
+    rf"|aujourd['’]hui|hier"
+    rf"|\d{{1,2}}\s+(?:{_EDUCH_MONTHS}))\s+",
+    re.I)
+
 
 def _parse_educh_anchor(text: str):
     """Décompose le libellé d'un lien educh en (titre, lieu, taux, employeur).
@@ -1664,6 +1694,7 @@ def _parse_educh_anchor(text: str):
     cela évite l'enrichissement par lecture de page (la page educh est polluée par
     d'autres annonces, ce qui fausserait la pertinence). Champs absents → "".
     """
+    text = _EDUCH_DATE_PREFIX_RE.sub("", text.strip())
     title = re.split(rf"[{_EDUCH_EMOJI}]", text, maxsplit=1)[0].strip(" -–·|")
     location = taux = company = ""
     for marker, val in _EDUCH_SEG_RE.findall(text):
@@ -1686,8 +1717,12 @@ def scrape_educh() -> list:
     """
     jobs, seen_urls = [], set()
     raw_links = 0
-    # Listes filtrées canton + ville de Genève (seen_urls évite les doublons).
-    for url in ("https://www.educh.ch/emploi/geneve-canton/",
+    # Source principale : la page de recherche Genève (fonctionne, déjà ciblée).
+    # Les listings /emploi/<canton>/ renvoient une erreur serveur (Smarty) depuis
+    # 2026-06 ; on les conserve pour reprise auto si educh les répare. seen_urls
+    # dédoublonne et in_zone() (dans consider) assure le filtre géographique.
+    for url in ("https://www.educh.ch/recherche/geneve.html",
+                "https://www.educh.ch/emploi/geneve-canton/",
                 "https://www.educh.ch/emploi/geneve-ville/"):
         soup = fetch(url)
         if not soup:
@@ -1718,6 +1753,12 @@ def scrape_bibliosuisse() -> list:
     Board national de l'association suisse des bibliothèques. La plupart des
     annonces sont alémaniques (écartées par la langue/les mots-clés français) ;
     on conserve les romandes/genevoises. robots.txt : autorisé.
+
+    NB : le sélecteur .articlewrapper fonctionne (vérifié : il extrait bien les
+    offres présentes, ex. Zoug/Berne). Un total de 0 = aucune offre romande/FR
+    ce jour-là, PAS un sélecteur cassé — le board est presque toujours 100 %
+    alémanique. D'où l'inscription dans HEALTH_SILENT_SOURCES (pas de fausse
+    alerte « cassé »).
     """
     jobs, seen_urls = [], set()
     url = "https://www.bibliosuisse.ch/fr/shop/offres-demploi"
@@ -1761,10 +1802,11 @@ def save_health(health: dict):
                            encoding="utf-8")
 
 
-# Sources connues comme dormantes (domaine hors-ligne / mur anti-bot persistant).
+# Sources connues comme dormantes (domaine hors-ligne / mur anti-bot persistant,
+# ou board fonctionnel mais quasi sans offre FR/romande — ex. bibliosuisse).
 # On continue de suivre leur santé, mais sans émettre d'alerte de bruit tant
 # qu'on ne les a pas réparées/repointées (elles restent dans SCRAPERS).
-HEALTH_SILENT_SOURCES = {"educa", "indeed_pw", "jobs_ch_pw"}
+HEALTH_SILENT_SOURCES = {"educa", "indeed_pw", "jobs_ch_pw", "bibliosuisse"}
 
 
 def update_health(source: str, count: int, health: dict) -> list:
