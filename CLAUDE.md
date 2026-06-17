@@ -104,3 +104,30 @@ Sources behind a JS anti-bot wall (myScience, Indeed) use Playwright with a
 stealth Chromium context (`_new_stealth_context`, `_STEALTH_INIT_JS`). This needs
 a **system Chromium** (`sudo apt install chromium-browser`); if none is found,
 `PLAYWRIGHT_AVAILABLE` is False and those sources are skipped gracefully.
+
+## Multi-agent collaboration (agent-bus)
+
+This project can be worked on by **several agent sessions at once** (e.g. `claude1`
+and `claude2`), coordinating over a shared Redis-Streams bus. Full launch/usage
+procedure is in `agent-bus-DEMARRAGE.md`; install is in `agent-bus-INSTALL.md`.
+
+If you are such a session, on startup:
+
+1. **Know who you are.** Your identity is `$AGENT_BUS_AGENT` (set when the session
+   was launched, default `claude1`). It must be **unique** per live session — never
+   share an identity with another running agent.
+2. **Enter the bus:** `source agent-bus.env` (exports `AGENT_BUS_PROJECT=find_job`,
+   the broker creds, and puts `agentbus` on `PATH`).
+3. **Announce + stay alive:** `agentbus status <you> working <msg>` — your
+   `status`/`report` *is* your heartbeat (no separate ping).
+4. **Listen for directives:** arm `agentbus subscribe <you>` as a **background task**
+   and **re-arm after every exit** (wake-on-exit model; do *not* wrap it in a loop
+   or daemon).
+
+Coordination primitives: `agentbus cmd <target> <…>` (directive), the 4-eyes gate
+`challenge`/`reply`/`verdict` (blocks the target until resolved — use it for
+cross-review before committing), and `report` for human-facing milestones. A human
+watches everything in `busmon --project find_job`.
+
+> `hermes` is **not** required: it is only an optional remote relay that forwards
+> curated reports to Signal. Agents collaborate directly on the bus without it.
