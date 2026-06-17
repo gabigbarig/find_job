@@ -32,7 +32,9 @@ import socket
 import time
 import hashlib
 import smtplib
+import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from html import escape
@@ -102,8 +104,13 @@ MIN_SCORE = int(os.environ.get("MIN_SCORE", "2"))
 # Coûte une requête supplémentaire par offre « limite », mais récupère les
 # offres au titre neutre. Désactivable via FETCH_DESCRIPTIONS=0.
 FETCH_DESCRIPTIONS = os.environ.get("FETCH_DESCRIPTIONS", "1") not in ("0", "false", "False")
-# Nombre max de pages de détail récupérées par run (garde-fou anti-explosion)
-MAX_DETAIL_FETCHES = int(os.environ.get("MAX_DETAIL_FETCHES", "40"))
+# Nombre max de pages de détail récupérées par run (garde-fou anti-explosion).
+# Relevé à 80 : avec la parallélisation des scrapers, on peut lire plus de fiches
+# ambiguës (meilleur recall des titres « déguisés ») sans alourdir le run.
+MAX_DETAIL_FETCHES = int(os.environ.get("MAX_DETAIL_FETCHES", "80"))
+# Indeed est bloqué par un mur anti-bot persistant (renvoie 0) et coûte ~50 s via
+# Playwright : désactivé par défaut. Réactivable avec ENABLE_INDEED=1 sans le retirer.
+ENABLE_INDEED = os.environ.get("ENABLE_INDEED", "0") not in ("0", "false", "False")
 # Budget dédié à l'extraction de l'employeur (lecture des pages de détail des
 # offres nouvelles sans entreprise). Séparé pour ne pas concurrencer ci-dessus.
 MAX_EMPLOYER_FETCHES = int(os.environ.get("MAX_EMPLOYER_FETCHES", "40"))
@@ -185,12 +192,28 @@ KEYWORDS = [
     "lettres", "littérature", "assistant de recherche",
     "maître assistant", "assistant doctorant",
     "post-doctorant", "chargé de cours", "linguistique",
+    # --- Ajouts recall (élargissement ciblé profil Lettres) ---
+    # NB : « maître de discipline » / « maître spécialiste » volontairement EXCLUS
+    # (trop génériques : captent les « disciplines spéciales » ACM/textile/sport,
+    # hors Lettres). Les vrais postes restent pris par « français »/« expression
+    # orale »/« diction », etc.
+    "professeur de lettres", "enseignant de lettres",
+    "conseiller pédagogique", "conseillère pédagogique",
+    "répétiteur", "répétitrice", "écrivain public",
+    "assistant éditorial", "assistante éditoriale", "coordinateur éditorial",
+    "chef de projet éditorial", "rédacteur technique", "lexicographe",
+    "terminologue", "médiathécaire", "responsable de médiathèque",
+    "guide-conférencier", "guide conférencier", "chargé de médiation",
+    "chargée de médiation", "médiation du livre", "animateur lecture",
+    "spécialiste en information documentaire", "gestionnaire de l'information",
 ]
 
 # Termes désignant un poste d'enseignant (conventions cantonales variées)
 TEACHING_TERMS = [
     "enseignement", "enseignant", "enseignante", "maître", "maîtresse",
     "professeur", "professeure", "chargé de cours", "chargée de cours",
+    "formateur", "formatrice", "intervenant", "intervenante",
+    "répétiteur", "répétitrice", "précepteur", "préceptrice",
 ]
 
 # Matières / domaines liés aux Lettres Modernes
@@ -198,6 +221,7 @@ LETTRES_SUBJECTS = [
     "français", "lettres", "littérature", "expression orale", "diction",
     "culture générale", "linguistique",
     "édition", "rédaction", "communication", "médiation", "patrimoine",
+    "lecture", "écriture", "humanités", "information documentaire", "livre",
 ]
 
 EXCLUDE_KEYWORDS = [
@@ -256,12 +280,17 @@ GENEVE_ZONE = {
 # Utilitaires
 # ---------------------------------------------------------------------------
 
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    # Verrou : évite l'entrelacement des lignes quand les scrapers tournent en parallèle.
+    with _LOG_LOCK:
+        print(line)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def normalize(text: str) -> str:
@@ -486,16 +515,23 @@ def robots_allows(url: str) -> bool:
 
 
 # --- Délai poli par domaine ---
+# Verrou : avec les scrapers parallélisés (ThreadPoolExecutor dans main()), on
+# garantit le délai poli PAR DOMAINE même si plusieurs threads visent le même hôte.
 _LAST_REQUEST: dict = {}
+_POLITE_LOCK = threading.Lock()
 
 
 def _polite_wait(url: str):
     domain = urlparse(url).netloc
-    last = _LAST_REQUEST.get(domain, 0.0)
-    elapsed = time.time() - last
-    if elapsed < POLITE_DELAY:
-        time.sleep(POLITE_DELAY - elapsed)
-    _LAST_REQUEST[domain] = time.time()
+    with _POLITE_LOCK:
+        last = _LAST_REQUEST.get(domain, 0.0)
+        elapsed = time.time() - last
+        wait = POLITE_DELAY - elapsed if elapsed < POLITE_DELAY else 0.0
+        # On réserve le créneau avant de dormir pour qu'un autre thread visant le
+        # même domaine s'aligne derrière (pas de rafale simultanée).
+        _LAST_REQUEST[domain] = time.time() + wait
+    if wait > 0:
+        time.sleep(wait)
 
 
 # Cache de résolution DNS par hôte (évite de re-tester un domaine mort à chaque URL).
@@ -978,6 +1014,10 @@ def scrape_jobscout24() -> list:
         "edition", "professeur-francais", "enseignant", "mediateur-culturel",
         "charge-de-communication", "archiviste", "musee", "patrimoine",
         "mediation", "charge-de-projet-culturel",
+        # Ajouts recall (profil Lettres)
+        "professeur-de-lettres", "enseignant-de-francais", "relecteur",
+        "assistant-editorial", "charge-edition", "mediathecaire",
+        "guide-conferencier", "redacteur-technique", "concepteur-redacteur",
     ]
     BASE = "https://www.jobscout24.ch"
     jobs, seen_urls = [], set()
@@ -1098,6 +1138,9 @@ def scrape_adzuna() -> list:
         "traducteur", "journaliste", "documentaliste", "professeur français",
         "communication culturelle", "archiviste", "médiateur culturel",
         "chargé de projet culturel",
+        # Ajouts recall (profil Lettres)
+        "professeur de lettres", "assistant éditorial", "relecteur",
+        "médiathécaire", "chargé de médiation", "rédacteur technique",
     ]
     jobs, seen_urls = [], set()
     for kw in KEYWORDS_AZ:
@@ -1212,6 +1255,8 @@ INDEED_QUERIES = [
 
 def scrape_indeed_pw() -> list:
     """Offres Indeed CH via Playwright. Nécessite un Chromium système (apt)."""
+    if not ENABLE_INDEED:
+        return []                # désactivé par défaut (anti-bot) — cf. ENABLE_INDEED
     if not PLAYWRIGHT_AVAILABLE:
         log("Indeed : Chromium système introuvable — source ignorée (sudo apt install chromium-browser)")
         return []
@@ -1267,11 +1312,17 @@ def scrape_indeed_pw() -> list:
     return jobs
 
 
-# Mots-clés ciblés profil Lettres pour jobs.ch (limités pour borner les requêtes).
+# Mots-clés ciblés profil Lettres pour jobs.ch, + noms d'écoles privées genevoises
+# (elles publient sur jobs.ch — cf. découverte ; une requête par école capte leurs
+# postes de français/lettres). Bornés pour limiter le nombre de requêtes.
 JOBS_CH_QUERIES = [
-    "enseignant français", "professeur français", "bibliothécaire",
-    "archiviste", "documentaliste", "rédacteur", "correcteur",
+    "enseignant français", "professeur français", "professeur de lettres",
+    "bibliothécaire", "archiviste", "documentaliste", "médiathécaire",
+    "rédacteur", "correcteur", "assistant éditorial",
     "médiateur culturel", "chargé de projet culturel",
+    # Écoles privées genevoises
+    "Florimont", "Collège du Léman", "École Moser",
+    "Institut International de Lancy",
 ]
 # Préfixe de date relative collé au titre dans la liste jobs.ch.
 _JOBSCH_DATE_RE = re.compile(
@@ -1934,6 +1985,11 @@ SCRAPERS = [
     scrape_indeed_pw, scrape_adzuna, scrape_jobs_ch_pw,
 ]
 
+# Sources rendues via Playwright : exécutées en séquence dans un seul thread (l'API
+# sync de Playwright ne supporte pas le parallélisme multi-thread), en parallèle du
+# pool HTTP. Voir la parallélisation dans main().
+PLAYWRIGHT_SCRAPERS = (scrape_myscience, scrape_indeed_pw, scrape_jobs_ch_pw)
+
 
 def main():
     log("=== Démarrage de la recherche d'emploi ===")
@@ -1963,8 +2019,11 @@ def main():
 
     # Purge des liens morts : une offre dont la page renvoie 404/410 a été retirée
     # par la source et ne doit plus figurer dans le rapport (lien cassé).
+    # Parallélisé (requêtes HEAD indépendantes) pour ne pas allonger le run.
     before = len(all_jobs)
-    all_jobs = [j for j in all_jobs if not url_is_dead(j["url"])]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        dead_flags = list(pool.map(lambda j: url_is_dead(j["url"]), all_jobs))
+    all_jobs = [j for j, is_dead in zip(all_jobs, dead_flags) if not is_dead]
     dead = before - len(all_jobs)
     if dead:
         log(f"Liens morts : {dead} offre(s) retirée(s) (page 404/410)")
@@ -1977,15 +2036,37 @@ def main():
 
     raw = []
     health_alerts = []
-    for scraper in SCRAPERS:
-        source_name = scraper.__name__.replace("scrape_", "")
+
+    def _run_one(scraper):
+        """Exécute un scraper isolément → [(nom, résultats)] ; n'émet jamais d'exception."""
+        name = scraper.__name__.replace("scrape_", "")
         try:
-            results = scraper()
-            raw.extend(results)
-            health_alerts.extend(update_health(source_name, len(results), health))
+            return [(name, scraper())]
         except Exception as e:
             log(f"⚠️  {scraper.__name__} a échoué : {e}")
-            health_alerts.extend(update_health(source_name, 0, health))
+            return [(name, [])]
+
+    def _run_playwright_group():
+        """Sources Playwright en SÉQUENCE (l'API sync ne tolère pas le multi-thread)."""
+        out = []
+        for scraper in PLAYWRIGHT_SCRAPERS:
+            out.extend(_run_one(scraper))
+        return out
+
+    # Scrapers HTTP en parallèle (I/O-bound) + groupe Playwright dans une tâche unique
+    # lancée en parallèle. La politesse par domaine est garantie par _POLITE_LOCK.
+    http_scrapers = [s for s in SCRAPERS if s not in PLAYWRIGHT_SCRAPERS]
+    collected = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(_run_one, s) for s in http_scrapers]
+        futures.append(pool.submit(_run_playwright_group))
+        for fut in as_completed(futures):
+            collected.extend(fut.result())
+
+    # Agrégation SÉQUENTIELLE dans le thread principal (pas de race sur raw/health).
+    for source_name, results in collected:
+        raw.extend(results)
+        health_alerts.extend(update_health(source_name, len(results), health))
 
     # Nouvelles offres : enrichissement employeur + même gate de pertinence.
     new_jobs = []
