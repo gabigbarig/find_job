@@ -571,6 +571,32 @@ def _is_permanent_error(exc: Exception) -> bool:
     return False
 
 
+# Empreintes d'une page d'erreur servie en HTTP 200 (ex. educh : erreur Smarty/PHP).
+# On la traite comme un ÉCHEC de fetch : ça évite (a) de prendre une page cassée pour
+# une « liste vide mais valide » (cf. canari de santé) et (b) d'empoisonner un futur
+# cache de fiches. MARQUEURS À AJUSTER SI BESOIN.
+_ERROR_PAGE_MARKERS = (
+    "fatal error", "smarty", "undefined property", "uncaught",
+    "stack trace", "internal server error", "service unavailable",
+    "you have an error in your sql syntax",
+)
+
+
+def _looks_like_error_page(html: str) -> str:
+    """Retourne la raison si `html` ressemble à une page d'erreur serveur (réponse
+    HTTP 200 trompeuse), sinon "". Prudent : un marqueur d'erreur explicite, ou un
+    corps minuscule sans le moindre lien (page quasi vide)."""
+    if not html or not html.strip():
+        return "corps vide"
+    low = html.lower()
+    for marker in _ERROR_PAGE_MARKERS:
+        if marker in low:
+            return f"marqueur « {marker} »"
+    if len(html) < 600 and "<a" not in low:
+        return f"corps minuscule ({len(html)} o, aucun lien)"
+    return ""
+
+
 def fetch(url: str, retries: int = 3):
     """GET poli avec respect de robots.txt, délai par domaine et back-off.
 
@@ -585,6 +611,10 @@ def fetch(url: str, retries: int = 3):
         try:
             r = SESSION.get(url, timeout=15)
             r.raise_for_status()
+            err = _looks_like_error_page(r.text)
+            if err:
+                log(f"⚠️  {url} : page d'erreur serveur ({err}) — traitée comme échec")
+                return None
             return BeautifulSoup(r.text, "lxml")
         except Exception as e:
             if _is_permanent_error(e):
@@ -619,6 +649,11 @@ def url_is_dead(url: str) -> bool:
 # --- Compteurs globaux de fetches de détail (garde-fous séparés) ---
 _detail_fetch_count = 0      # lecture des titres ambigus (consider)
 _employer_fetch_count = 0    # extraction de l'employeur (déduplication)
+
+# Canari d'extraction : nb de candidats BRUTS passés au funnel par source (clé =
+# champ « source », ex. "educh.ch"). Remis à zéro au début de main(). Distingue
+# « sélecteur cassé » (0 brut) de « 0 offre pertinente » (brut > 0, tout filtré).
+_raw_counts: dict = {}
 
 
 def _page_text(url: str) -> str:
@@ -857,7 +892,11 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
 
     base_fields doit contenir au moins company, source, location.
     """
-    if not title or not url or url in seen_urls:
+    if not title or not url:
+        return
+    src = base_fields.get("source", "?")
+    _raw_counts[src] = _raw_counts.get(src, 0) + 1   # candidat brut (avant filtres)
+    if url in seen_urls:
         return
     if not is_french_text(title):
         log(f"Rejeté (langue non-FR) : {title[:70]}")
@@ -1616,54 +1655,42 @@ def scrape_museums() -> list:
     return jobs
 
 
-# Portail emploi enseignant. job.educa.ch est HORS LIGNE depuis 2025 : le
-# sous-domaine ne résout plus dans le DNS mondial (NXDOMAIN, vérifié via
-# dns.google). Grâce au fail-fast de fetch(), un échec DNS ne coûte plus qu'une
-# ligne de log. Dès qu'un portail successeur est connu, repointer ici (1 ligne).
-EDUCA_URLS = [
-    "https://job.educa.ch/fr/recherche",
-    "https://job.educa.ch/fr",
-]
+# Successeur du portail enseignant educa.Job (job.educa.ch), HORS LIGNE depuis 2025
+# (NXDOMAIN). On repointe « educa » vers le portail de recrutement de la HES-SO
+# Genève : vivant, rendu côté serveur (Next.js SSR → simple fetch, pas de
+# Playwright), déjà ciblé Genève. Couvre le supérieur genevois (HEAD art/design,
+# HEM musique, HETS travail social, HEG, HEPIA, HEdS) : chargé·e de cours,
+# assistant·e HES, adjoint·e scientifique/artistique… — complète unige
+# (université) sans la recouper.
+HESGE_OFFERS_URL = "https://recrutement.hesge.ch/fr/offres"
 
 
 def scrape_educa() -> list:
-    """Offres d'enseignement via le portail officiel du corps enseignant suisse.
+    """Offres HES-SO Genève (recrutement.hesge.ch) — supérieur / académique / artistique.
 
-    Source conservée mais actuellement injoignable (voir EDUCA_URLS). Renvoie 0
-    proprement et sans pénalité de temps tant qu'aucun successeur n'est repointé.
+    Repointage de l'ancien educa.Job (job.educa.ch hors ligne depuis 2025). Chaque
+    offre est un lien « /nos-offres/<slug>-<id> » dont le texte EST déjà le titre
+    propre. consider() applique langue + pertinence + zone ; le canari de santé
+    (compte brut par source) gère la détection de panne, donc pas de _warn_if_empty
+    ici (un 0 PERTINENT est légitime : la plupart des postes HES sont hors profil).
+    SÉLECTEUR À AJUSTER SI BESOIN : a[href*="/nos-offres/"].
     """
     jobs, seen_urls = [], set()
-    reachable = False
-    for url in EDUCA_URLS:
-        # job.educa.ch est hors-ligne (NXDOMAIN). Si le host ne résout pas, on
-        # saute SANS fetch ni log d'erreur : la source reste en sommeil, prête à
-        # reprendre dès que le DNS répond ou qu'on repointe EDUCA_URLS.
-        if not host_resolves(url):
+    soup = fetch(HESGE_OFFERS_URL)
+    if not soup:
+        return jobs
+    seen_hrefs = set()
+    for a in soup.select('a[href*="/nos-offres/"]'):
+        href = a.get("href", "")
+        title = a.get_text(" ", strip=True)
+        if not title or len(title) < 5 or href in seen_hrefs:
             continue
-        reachable = True
-        soup = fetch(url)
-        if not soup:
-            continue
-        # --- SÉLECTEUR À AJUSTER SI BESOIN ---
-        candidates = soup.select(
-            "a[href*='/offre'], a[href*='/job'], a[href*='/stelle'], "
-            "article a[href], .views-row a[href], li a[href], h2 a[href], h3 a[href]"
-        )
-        for a in candidates:
-            title = a.get_text(strip=True)
-            href = a.get("href", "")
-            if not title or len(title) < 6 or not href:
-                continue
-            full_url = urljoin("https://job.educa.ch/", href)
-            consider(title, full_url,
-                     {"company": "École (educa.Job)", "source": "job.educa.ch",
-                      "location": "Suisse"}, jobs, seen_urls)
-        if jobs:
-            break
-    # Tant que le portail est injoignable, on reste totalement silencieux.
-    if reachable:
-        _warn_if_empty("job.educa.ch", jobs)
-        log(f"job.educa.ch: {len(jobs)} offre(s) trouvée(s)")
+        seen_hrefs.add(href)
+        full_url = urljoin(HESGE_OFFERS_URL, href)
+        consider(title, full_url,
+                 {"company": "HES-SO Genève", "source": "recrutement.hesge.ch",
+                  "location": "Genève"}, jobs, seen_urls)
+    log(f"recrutement.hesge.ch: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
@@ -1806,13 +1833,19 @@ def save_health(health: dict):
 # ou board fonctionnel mais quasi sans offre FR/romande — ex. bibliosuisse).
 # On continue de suivre leur santé, mais sans émettre d'alerte de bruit tant
 # qu'on ne les a pas réparées/repointées (elles restent dans SCRAPERS).
-HEALTH_SILENT_SOURCES = {"educa", "indeed_pw", "jobs_ch_pw", "bibliosuisse"}
+# NB : « educa » a été repointé vers recrutement.hesge.ch (source vivante) → retiré
+# d'ici pour que le canari de santé le surveille de nouveau.
+HEALTH_SILENT_SOURCES = {"indeed_pw", "jobs_ch_pw", "bibliosuisse"}
 
 
-def update_health(source: str, count: int, health: dict) -> list:
+def update_health(source: str, count: int, health: dict,
+                  raw: int = None, source_field: str = None) -> list:
     """Met à jour l'historique et renvoie des alertes si une source dégénère.
 
-    Alerte si une source qui ramenait >0 en moyenne tombe à 0.
+    `raw` = nb de candidats BRUTS extraits (avant filtrage) si connu : distingue un
+    sélecteur cassé (0 brut) d'une simple absence d'offre pertinente (brut > 0).
+    `source_field` = champ « source » de la source, mémorisé pour retrouver son
+    compte brut lors d'un run où elle ne renvoie plus aucune offre.
     """
     alerts = []
     entry = health.get(source, {"runs": 0, "total": 0, "last": None, "max": 0})
@@ -1821,9 +1854,26 @@ def update_health(source: str, count: int, health: dict) -> list:
     entry["total"] += count
     entry["last"] = count
     entry["max"] = max(entry["max"], count)
+    if source_field:
+        entry["source_field"] = source_field
+    if raw is not None:
+        entry["raw_last"] = raw
+        entry["raw_max"] = max(entry.get("raw_max", 0), raw)
     health[source] = entry
     if source in HEALTH_SILENT_SOURCES:
         return alerts          # suivi conservé, mais pas d'alerte (source en sommeil)
+    # Source à extraction suivie (raw connu) : on se fie au compte BRUT, qui
+    # distingue une vraie panne d'une simple absence d'offre pertinente. Détectable
+    # dès le 1er run KO (pas besoin d'attendre N runs).
+    if raw is not None:
+        if raw == 0 and entry.get("raw_max", 0) > 0:
+            alerts.append(
+                f"🚨 {source} : 0 candidat brut extrait (jusqu'à {entry['raw_max']} "
+                f"auparavant) — page/sélecteur probablement cassé."
+            )
+        # raw > 0 : la source fonctionne ; 0 offre PERTINENTE n'est pas une panne.
+        return alerts
+    # Sources sans signal brut (court-circuitent consider) : heuristique sur le count.
     # Détection de panne : la source produisait régulièrement, et tombe à 0
     if count == 0 and entry["max"] >= 1 and avg_before >= 0.5 and entry["runs"] > 2:
         alerts.append(
@@ -2108,7 +2158,17 @@ def main():
     # Agrégation SÉQUENTIELLE dans le thread principal (pas de race sur raw/health).
     for source_name, results in collected:
         raw.extend(results)
-        health_alerts.extend(update_health(source_name, len(results), health))
+        # Canari : compte de candidats bruts (clé = champ « source », appris des
+        # résultats ou mémorisé d'un run précédent). raw=0 n'est retenu que pour une
+        # source qui extrayait avant ; sinon None = pas de signal brut fiable (p. ex.
+        # sources qui court-circuitent consider()).
+        sf = (results[0].get("source") if results
+              else health.get(source_name, {}).get("source_field"))
+        had_raw = health.get(source_name, {}).get("raw_max", 0) > 0
+        raw_n = (_raw_counts.get(sf, 0)
+                 if (sf and (sf in _raw_counts or had_raw)) else None)
+        health_alerts.extend(
+            update_health(source_name, len(results), health, raw=raw_n, source_field=sf))
 
     # Nouvelles offres : enrichissement employeur + même gate de pertinence.
     new_jobs = []
