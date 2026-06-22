@@ -1,6 +1,6 @@
 # Démarrage de la collaboration multi-agents sur `find_job`
 
-Comment faire travailler **deux agents Claude ensemble** (et, plus tard, Codex) via
+Comment faire travailler **deux agents Claude ou Codex ensemble** via
 l'agent-bus, sur ce dépôt. Pour l'**installation** des binaires/broker, voir
 `agent-bus-INSTALL.md`. Ce fichier-ci décrit le **lancement au quotidien**.
 
@@ -8,9 +8,10 @@ l'agent-bus, sur ce dépôt. Pour l'**installation** des binaires/broker, voir
 
 ## En une phrase
 
-Le bus (Redis + `agentbus`/`busmon`) est déjà installé et les hooks Claude Code de
-ce projet sont déjà posés. Pour collaborer, il suffit d'**ouvrir trois terminaux**
-(un dashboard + deux agents) ; les agents s'annoncent tout seuls sur le bus.
+Le bus (Redis + `agentbus`/`busmon`) est déjà installé. Pour collaborer, il suffit
+d'**ouvrir trois terminaux** : un dashboard + deux agents. Les hooks Claude
+s'annoncent automatiquement ; les sessions Codex doivent s'annoncer manuellement
+au démarrage.
 
 ---
 
@@ -37,16 +38,34 @@ source agent-bus.env
 busmon --project find_job
 ```
 
-### Terminal 2 — Claude n°1
+### Terminal 2 — agent principal
 ```bash
 cd ~/git_projects/find_job
 AGENT_BUS_AGENT=claude1 claude --model claude-opus-4-8 --effort max
 ```
 
-### Terminal 3 — Claude n°2
+Ou avec Codex :
+
+```bash
+cd ~/git_projects/find_job
+export AGENT_BUS_AGENT=codex1
+source agent-bus.env
+codex --cd ~/git_projects/find_job --model gpt-5.5 --config model_reasoning_effort='"xhigh"' --config sandbox_workspace_write.network_access=true --sandbox workspace-write --ask-for-approval never
+```
+
+### Terminal 3 — agent reviewer
 ```bash
 cd ~/git_projects/find_job
 AGENT_BUS_AGENT=claude2 claude --model claude-opus-4-8 --effort max
+```
+
+Ou avec Codex :
+
+```bash
+cd ~/git_projects/find_job
+export AGENT_BUS_AGENT=codex2
+source agent-bus.env
+codex --cd ~/git_projects/find_job --model gpt-5.5 --config model_reasoning_effort='"xhigh"' --config sandbox_workspace_write.network_access=true --sandbox workspace-write --ask-for-approval never
 ```
 
 > **Modèle & « mode max »** : `--model claude-opus-4-8` = Opus 4.8, `--effort max` =
@@ -55,8 +74,12 @@ AGENT_BUS_AGENT=claude2 claude --model claude-opus-4-8 --effort max
 > `claude` sans flag utilise Opus 4.8 ici ; le `--effort max`, lui, se passe au lancement
 > (ou via `/effort max` une fois la session ouverte).
 
-Grâce aux hooks, **les deux sessions apparaissent automatiquement** dans `busmon`
-en `working` dès l'ouverture. Rien d'autre à taper pour qu'elles soient « vivantes ».
+Grâce aux hooks, **les sessions Claude apparaissent automatiquement** dans
+`busmon` en `working` dès l'ouverture. Pour Codex, demandez au démarrage :
+
+> « annonce-toi sur agent-bus avec ton identité, puis arme
+> `agentbus subscribe <toi>` en tâche d'arrière-plan ; ré-arme après chaque
+> directive reçue. »
 
 ---
 
@@ -125,10 +148,7 @@ busmon --project find_job
 
 Ce ne sont pas des oublis, mais des dépendances absentes :
 
-1. **Codex en agent vivant** — aucun CLI `codex` n'est installé ici. Pour l'instant
-   on collabore avec **deux Claude** (`claude1` + `claude2`). Pour ajouter un vrai
-   Codex : installer son CLI puis le câbler sur le bus (`AGENT_BUS_AGENT=codex1`).
-2. **`hermes` / Signal** — `hermes` n'est **pas** le lien entre les agents : c'est un
+1. **`hermes` / Signal** — `hermes` n'est **pas** le lien entre les agents : c'est un
    relais *optionnel* qui pousse des rapports filtrés vers Signal depuis une machine
    **distante** (gateway `:8644`). Cette infra n'existe pas ici, et elle n'est pas
    nécessaire pour que les agents collaborent : ils le font directement sur le bus.

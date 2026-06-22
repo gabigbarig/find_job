@@ -1,12 +1,18 @@
 #!/bin/bash
-# Relance le scraper, puis publie docs/index.html sur GitHub Pages
+# Relance le scraper, puis publie les profils sur GitHub Pages
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$SCRIPT_DIR/venv/bin/python3"
+PROFILE="${1:-all}"
 cd "$SCRIPT_DIR"
 
-"$VENV" scraper.py
+"$VENV" scraper.py --profile "$PROFILE"
 
-git add docs/index.html
+if [ "$PROFILE" = "all" ]; then
+  git add docs/index.html docs/lettres/index.html docs/lettres/feed.xml \
+          docs/comptabilite/index.html docs/comptabilite/feed.xml
+else
+  git add docs/index.html "docs/$PROFILE/index.html" "docs/$PROFILE/feed.xml"
+fi
 git commit -m "Mise à jour des offres d'emploi $(date '+%Y-%m-%d %H:%M')"
 git push
 

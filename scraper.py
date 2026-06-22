@@ -30,6 +30,7 @@ import re
 import shutil
 import socket
 import time
+import argparse
 import hashlib
 import smtplib
 import threading
@@ -115,10 +116,12 @@ ENABLE_INDEED = os.environ.get("ENABLE_INDEED", "0") not in ("0", "false", "Fals
 # offres nouvelles sans entreprise). Séparé pour ne pas concurrencer ci-dessus.
 MAX_EMPLOYER_FETCHES = int(os.environ.get("MAX_EMPLOYER_FETCHES", "40"))
 
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DOCS_DIR = BASE_DIR / "docs"
-DOCS_DIR.mkdir(exist_ok=True)
+DATA_ROOT = BASE_DIR / "data"
+DATA_ROOT.mkdir(exist_ok=True)
+DOCS_ROOT = BASE_DIR / "docs"
+DOCS_ROOT.mkdir(exist_ok=True)
+DATA_DIR = DATA_ROOT
+DOCS_DIR = DOCS_ROOT
 SEEN_FILE = DATA_DIR / "seen_jobs.json"
 RESULTS_FILE = DATA_DIR / "results.html"
 PUBLIC_FILE = DOCS_DIR / "index.html"
@@ -132,13 +135,22 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-SESSION = requests.Session()
-SESSION.headers.update({
+HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "fr-CH,fr;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-})
-HEADERS = dict(SESSION.headers)
+}
+_SESSION_LOCAL = threading.local()
+
+
+def session() -> requests.Session:
+    """Session HTTP propre au thread courant."""
+    sess = getattr(_SESSION_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        _SESSION_LOCAL.session = sess
+    return sess
 
 # ---------------------------------------------------------------------------
 # Mots-clés et zones — ÉLARGIS (point 3)
@@ -256,6 +268,119 @@ EXCLUDE_KEYWORDS = [
     "français langue étrangère", "français langue seconde", "fle",
 ]
 
+LETTRES_KEYWORDS = KEYWORDS[:]
+LETTRES_EXCLUDE_KEYWORDS = EXCLUDE_KEYWORDS[:]
+LETTRES_SUBJECTS = LETTRES_SUBJECTS[:]
+
+COMPTABILITE_KEYWORDS = [
+    "comptable", "aide-comptable", "aide comptable",
+    "assistant comptable", "assistante comptable",
+    "collaborateur comptable", "collaboratrice comptable",
+    "comptable junior", "comptable confirmé", "comptable confirmée",
+    "spécialiste comptabilité", "specialiste comptabilite",
+    "comptabilité", "comptabilite", "tenue de comptabilité",
+    "tenue de comptabilite", "teneur de comptes", "tenue des comptes",
+    "comptabilité fournisseurs", "comptabilite fournisseurs",
+    "comptabilité débiteurs", "comptabilite debiteurs",
+    "créanciers", "creanciers", "débiteurs", "debiteurs",
+    "accounts payable", "accounts receivable", "ap accountant",
+    "ar accountant", "accountant", "junior accountant", "bookkeeper",
+    "finance assistant", "assistant finance", "assistante finance",
+    "assistant financier", "assistante financière",
+    "facturation", "billing", "payroll", "gestionnaire salaires",
+    "gestionnaire de salaires", "salaires", "fiduciaire",
+    "collaborateur fiduciaire", "collaboratrice fiduciaire",
+    "réviseur comptable", "reviseur comptable", "audit comptable",
+    "contrôleur de gestion", "controleur de gestion",
+    "contrôle de gestion", "controle de gestion",
+    "employé de commerce comptabilité", "employée de commerce comptabilité",
+    "employe de commerce comptabilite", "employée de commerce fiduciaire",
+]
+
+COMPTABILITE_EXCLUDE_KEYWORDS = [
+    "enseignant", "enseignante", "professeur", "professeure",
+    "maître de français", "maîtresse de français", "bibliothécaire",
+    "documentaliste", "archiviste", "libraire", "rédacteur", "rédactrice",
+    "journaliste", "traducteur", "traductrice", "médiateur culturel",
+    "médiatrice culturelle", "muséologue", "commissaire d'exposition",
+    "informatique", "développeur", "développeuse", "ingénieur", "ingénieure",
+    "médecin", "infirmier", "infirmière", "aide-soignant", "aide-soignante",
+    "psychologue", "éducateur", "éducatrice", "assistant social",
+    "assistante sociale", "juriste", "avocat", "avocate", "greffier",
+    "greffière", "technicien", "technicienne", "mécanicien", "électricien",
+    "chauffeur", "cuisinier", "serveur", "vendeur automobile",
+    "français langue étrangère", "français langue seconde", "fle",
+]
+
+COMPTABILITE_SUBJECTS = [
+    "comptabilité", "comptabilite", "finance", "fiduciaire",
+    "facturation", "salaires", "créanciers", "creanciers",
+    "débiteurs", "debiteurs",
+]
+
+COMPTABILITE_SOURCE_TERMS = {
+    "jobscout24": [
+        "comptable", "aide-comptable", "assistant-comptable",
+        "comptabilite", "fiduciaire", "finance", "facturation",
+        "accounts-payable", "accounts-receivable", "accountant",
+        "payroll", "controleur-de-gestion",
+    ],
+    "jobup": [
+        "comptable", "aide-comptable", "assistant comptable",
+        "comptabilité fournisseurs", "comptabilité débiteurs",
+        "fiduciaire", "facturation", "assistant finance",
+        "finance assistant", "payroll", "gestionnaire salaires",
+        "contrôleur de gestion", "accountant",
+    ],
+    "adzuna": [
+        "comptable", "aide-comptable", "assistant comptable",
+        "fiduciaire", "facturation", "assistant finance",
+        "accounts payable", "accounts receivable", "payroll",
+        "contrôleur de gestion", "accountant",
+    ],
+    "jobs_ch": [
+        "comptable", "aide-comptable", "assistant comptable",
+        "comptabilité fournisseurs", "comptabilité débiteurs",
+        "fiduciaire", "facturation", "assistant finance",
+        "accounts payable", "accounts receivable", "payroll",
+        "contrôleur de gestion", "accountant",
+    ],
+}
+
+DEFAULT_PROFILE = "lettres"
+SITE_BASE_URL = "https://gabigbarig.github.io/find_job/"
+PROFILES = {
+    "lettres": {
+        "label": "Lettres modernes",
+        "title": "Offres d'emploi – Lettres Modernes – Genève",
+        "rss_title": "Offres Lettres Modernes – Genève",
+        "description": "Veille d'offres Lettres modernes dans la zone Genève et Nyon proche",
+        "keywords": LETTRES_KEYWORDS,
+        "exclude_keywords": LETTRES_EXCLUDE_KEYWORDS,
+        "subjects": LETTRES_SUBJECTS,
+        "min_score": 2,
+    },
+    "comptabilite": {
+        "label": "Comptabilité",
+        "title": "Offres d'emploi – Comptabilité – Genève",
+        "rss_title": "Offres Comptabilité – Genève",
+        "description": "Veille d'offres en comptabilité dans la zone Genève et Nyon proche",
+        "keywords": COMPTABILITE_KEYWORDS,
+        "exclude_keywords": COMPTABILITE_EXCLUDE_KEYWORDS,
+        "subjects": COMPTABILITE_SUBJECTS,
+        "min_score": 2,
+    },
+}
+ACTIVE_PROFILE = DEFAULT_PROFILE
+ACTIVE_PROFILE_CONFIG = PROFILES[DEFAULT_PROFILE]
+PROFILE_SOURCE_TERMS = {"comptabilite": COMPTABILITE_SOURCE_TERMS}
+
+
+def source_terms(source: str, default_terms: list) -> list:
+    """Termes de recherche adaptés au profil actif pour les agrégateurs privés."""
+    return PROFILE_SOURCE_TERMS.get(ACTIVE_PROFILE, {}).get(source, default_terms)
+
+
 # Communes du district de Nyon PROCHES de Genève (zone resserrée).
 # On exclut volontairement Gland, Rolle, Lausanne, Morges (trop loin).
 VAUD_ZONE = {
@@ -295,7 +420,8 @@ def log(msg: str):
 
 def normalize(text: str) -> str:
     """Minuscule + suppression des accents pour un matching robuste."""
-    text = text.lower()
+    text = str(text or "").replace("œ", "oe").replace("Œ", "OE")
+    text = text.replace("æ", "ae").replace("Æ", "AE").lower()
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     return text
@@ -335,6 +461,57 @@ _KW_RE = _compile_terms(KEYWORDS)
 _EXCLUDE_RE = _compile_terms(EXCLUDE_KEYWORDS)
 _TEACHING_RE = _compile_terms(TEACHING_TERMS)
 _SUBJECTS_RE = _compile_terms(LETTRES_SUBJECTS)
+
+
+def profile_url(profile: str) -> str:
+    return f"{SITE_BASE_URL}{profile}/"
+
+
+def configure_profile(profile: str):
+    """Active les critères, chemins et libellés d'un profil de veille."""
+    global ACTIVE_PROFILE, ACTIVE_PROFILE_CONFIG
+    global KEYWORDS, EXCLUDE_KEYWORDS, MIN_SCORE
+    global DATA_DIR, DOCS_DIR, SEEN_FILE, RESULTS_FILE, PUBLIC_FILE
+    global LOG_FILE, HEALTH_FILE, RSS_FILE
+    global _KW_RE, _EXCLUDE_RE, _SUBJECTS_RE
+
+    if profile not in PROFILES:
+        raise ValueError(f"Profil inconnu : {profile}")
+
+    cfg = PROFILES[profile]
+    ACTIVE_PROFILE = profile
+    ACTIVE_PROFILE_CONFIG = cfg
+    KEYWORDS = list(cfg["keywords"])
+    EXCLUDE_KEYWORDS = list(cfg["exclude_keywords"])
+    MIN_SCORE = int(os.environ.get("MIN_SCORE", str(cfg.get("min_score", 2))))
+    _KW_RE = _compile_terms(KEYWORDS)
+    _EXCLUDE_RE = _compile_terms(EXCLUDE_KEYWORDS)
+    _SUBJECTS_RE = _compile_terms(cfg.get("subjects", []))
+
+    DATA_DIR = DATA_ROOT / profile
+    DOCS_DIR = DOCS_ROOT / profile
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    SEEN_FILE = DATA_DIR / "seen_jobs.json"
+    RESULTS_FILE = DATA_DIR / "results.html"
+    PUBLIC_FILE = DOCS_DIR / "index.html"
+    LOG_FILE = DATA_DIR / "scraper.log"
+    HEALTH_FILE = DATA_DIR / "health.json"
+    RSS_FILE = DOCS_DIR / "feed.xml"
+
+
+def bootstrap_legacy_profile_data():
+    """Copie l'ancien historique racine vers le profil Lettres au premier lancement."""
+    if ACTIVE_PROFILE != "lettres":
+        return
+    legacy_names = ("seen_jobs.json", "all_jobs.json", "health.json")
+    if any((DATA_DIR / name).exists() for name in legacy_names):
+        return
+    for name in legacy_names:
+        src = DATA_ROOT / name
+        dst = DATA_DIR / name
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
 
 # Marqueurs de titre générique : déclenchent la lecture de la description.
 _AMBIGUOUS_MARKERS = [
@@ -482,6 +659,7 @@ def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
 
 # --- Cache des parseurs robots.txt par domaine ---
 _ROBOTS_CACHE: dict = {}
+_ROBOTS_LOCK = threading.Lock()
 
 
 def robots_allows(url: str) -> bool:
@@ -490,22 +668,24 @@ def robots_allows(url: str) -> bool:
     from urllib.robotparser import RobotFileParser
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    rp = _ROBOTS_CACHE.get(base, "MISS")
+    with _ROBOTS_LOCK:
+        rp = _ROBOTS_CACHE.get(base, "MISS")
     if rp == "MISS":
-        # On récupère le robots.txt avec NOTRE User-Agent (SESSION) : la lib
+        # On récupère le robots.txt avec NOTRE User-Agent (session HTTP) : la lib
         # urllib.read() utilise l'UA « Python-urllib » que certains sites (educh.ch)
         # bloquent en 403, ce qui faisait conclure à tort « tout interdit ». On lit
         # donc exactement le robots.txt qui s'applique à nos requêtes réelles.
         rp = RobotFileParser()
         try:
-            r = SESSION.get(urljoin(base, "/robots.txt"), timeout=10)
+            r = session().get(urljoin(base, "/robots.txt"), timeout=10)
             if r.status_code == 200:
                 rp.parse(r.text.splitlines())
             else:
                 rp = None          # pas de robots.txt exploitable → pas de restriction
         except Exception:
             rp = None
-        _ROBOTS_CACHE[base] = rp
+        with _ROBOTS_LOCK:
+            _ROBOTS_CACHE[base] = rp
     if rp is None:
         return True
     try:
@@ -536,6 +716,7 @@ def _polite_wait(url: str):
 
 # Cache de résolution DNS par hôte (évite de re-tester un domaine mort à chaque URL).
 _DNS_CACHE: dict = {}
+_DNS_LOCK = threading.Lock()
 
 
 def host_resolves(url: str) -> bool:
@@ -547,13 +728,18 @@ def host_resolves(url: str) -> bool:
     host = urlparse(url).hostname
     if not host:
         return False
-    if host not in _DNS_CACHE:
-        try:
-            socket.getaddrinfo(host, None)
-            _DNS_CACHE[host] = True
-        except OSError:
-            _DNS_CACHE[host] = False
-    return _DNS_CACHE[host]
+    with _DNS_LOCK:
+        cached = _DNS_CACHE.get(host)
+    if cached is not None:
+        return cached
+    try:
+        socket.getaddrinfo(host, None)
+        resolved = True
+    except OSError:
+        resolved = False
+    with _DNS_LOCK:
+        _DNS_CACHE[host] = resolved
+    return resolved
 
 
 def _is_permanent_error(exc: Exception) -> bool:
@@ -576,8 +762,8 @@ def _is_permanent_error(exc: Exception) -> bool:
 # une « liste vide mais valide » (cf. canari de santé) et (b) d'empoisonner un futur
 # cache de fiches. MARQUEURS À AJUSTER SI BESOIN.
 _ERROR_PAGE_MARKERS = (
-    "fatal error", "smarty", "undefined property", "uncaught",
-    "stack trace", "internal server error", "service unavailable",
+    "fatal error", "smarty_internal", "smartyexception", "undefined property",
+    "uncaught exception", "stack trace", "internal server error", "service unavailable",
     "you have an error in your sql syntax",
 )
 
@@ -609,7 +795,7 @@ def fetch(url: str, retries: int = 3):
     for attempt in range(retries):
         _polite_wait(url)
         try:
-            r = SESSION.get(url, timeout=15)
+            r = session().get(url, timeout=15)
             r.raise_for_status()
             err = _looks_like_error_page(r.text)
             if err:
@@ -637,10 +823,10 @@ def url_is_dead(url: str) -> bool:
         return False
     try:
         _polite_wait(url)
-        r = SESSION.head(url, timeout=10, allow_redirects=True)
+        r = session().head(url, timeout=10, allow_redirects=True)
         if r.status_code == 405:           # HEAD refusé : on retente en GET léger
             _polite_wait(url)
-            r = SESSION.get(url, timeout=15)
+            r = session().get(url, timeout=15)
         return r.status_code in (404, 410)
     except Exception:
         return False
@@ -649,11 +835,18 @@ def url_is_dead(url: str) -> bool:
 # --- Compteurs globaux de fetches de détail (garde-fous séparés) ---
 _detail_fetch_count = 0      # lecture des titres ambigus (consider)
 _employer_fetch_count = 0    # extraction de l'employeur (déduplication)
+_COUNTERS_LOCK = threading.Lock()
 
 # Canari d'extraction : nb de candidats BRUTS passés au funnel par source (clé =
 # champ « source », ex. "educh.ch"). Remis à zéro au début de main(). Distingue
 # « sélecteur cassé » (0 brut) de « 0 offre pertinente » (brut > 0, tout filtré).
 _raw_counts: dict = {}
+
+
+def mark_raw_source(source: str):
+    """Initialise le compteur brut d'une source, même si tous les candidats filtrent."""
+    with _COUNTERS_LOCK:
+        _raw_counts.setdefault(source, 0)
 
 
 def _page_text(url: str) -> str:
@@ -676,9 +869,10 @@ def fetch_description(url: str) -> str:
     Retourne "" si désactivé, quota atteint, ou échec.
     """
     global _detail_fetch_count
-    if not FETCH_DESCRIPTIONS or _detail_fetch_count >= MAX_DETAIL_FETCHES:
-        return ""
-    _detail_fetch_count += 1
+    with _COUNTERS_LOCK:
+        if not FETCH_DESCRIPTIONS or _detail_fetch_count >= MAX_DETAIL_FETCHES:
+            return ""
+        _detail_fetch_count += 1
     return _page_text(url)
 
 
@@ -689,9 +883,10 @@ def fetch_employer_page(url: str) -> str:
     ambigus, pour ne pas gonfler le volume de requêtes du scraping lui-même.
     """
     global _employer_fetch_count
-    if _employer_fetch_count >= MAX_EMPLOYER_FETCHES:
-        return ""
-    _employer_fetch_count += 1
+    with _COUNTERS_LOCK:
+        if _employer_fetch_count >= MAX_EMPLOYER_FETCHES:
+            return ""
+        _employer_fetch_count += 1
     return _page_text(url)
 
 
@@ -895,7 +1090,9 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
     if not title or not url:
         return
     src = base_fields.get("source", "?")
-    _raw_counts[src] = _raw_counts.get(src, 0) + 1   # candidat brut (avant filtres)
+    # Candidat brut avant filtres. Verrouillé car les scrapers HTTP tournent en parallèle.
+    with _COUNTERS_LOCK:
+        _raw_counts[src] = _raw_counts.get(src, 0) + 1
     if url in seen_urls:
         return
     if not is_french_text(title):
@@ -1007,7 +1204,7 @@ def scrape_vaud() -> list:
     headers_oracle = {**HEADERS, "Accept": "application/json", "ora-irc-vanity-domain": "Y"}
     try:
         _polite_wait(api_url)
-        r = SESSION.get(api_url, headers=headers_oracle, timeout=20)
+        r = session().get(api_url, headers=headers_oracle, timeout=20)
         r.raise_for_status()
         data = r.json()
         reqs = data.get("items", [{}])[0].get("requisitionList", [])
@@ -1062,14 +1259,14 @@ def scrape_jobscout24() -> list:
     jobs, seen_urls = [], set()
     search_configs = [("GE", GENEVE_ZONE), ("VD", VAUD_ZONE)]
 
-    for kw in KEYWORDS_JS24:
+    for kw in source_terms("jobscout24", KEYWORDS_JS24):
         for region_code, zone_filter in search_configs:
             url = f"{BASE}/fr/jobs/{kw}/?region={region_code}"
             if not robots_allows(url):
                 continue
             try:
                 _polite_wait(url)
-                r = SESSION.get(url, timeout=15)
+                r = session().get(url, timeout=15)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
@@ -1125,14 +1322,14 @@ def scrape_jobup() -> list:
     SEARCH_CONFIGS = [("region=34", None), ("location=nyon", VAUD_ZONE)]
     jobs, seen_urls = [], set()
 
-    for kw in KEYWORDS_JU:
+    for kw in source_terms("jobup", KEYWORDS_JU):
         for geo_param, zone_filter in SEARCH_CONFIGS:
             url = f"{BASE}/fr/emplois/?{geo_param}&term={quote(kw)}"
             if not robots_allows(url):
                 continue
             try:
                 _polite_wait(url)
-                r = SESSION.get(url, timeout=15)
+                r = session().get(url, timeout=15)
                 if r.status_code != 200:
                     continue
                 soup = BeautifulSoup(r.text, "lxml")
@@ -1182,7 +1379,7 @@ def scrape_adzuna() -> list:
         "médiathécaire", "chargé de médiation", "rédacteur technique",
     ]
     jobs, seen_urls = [], set()
-    for kw in KEYWORDS_AZ:
+    for kw in source_terms("adzuna", KEYWORDS_AZ):
         url = (
             "https://api.adzuna.com/v1/api/jobs/ch/search/1"
             f"?app_id={ADZUNA_ID}&app_key={ADZUNA_KEY}"
@@ -1192,7 +1389,7 @@ def scrape_adzuna() -> list:
         )
         try:
             _polite_wait(url)
-            r = SESSION.get(url, timeout=15)
+            r = session().get(url, timeout=15)
             if r.status_code != 200:
                 log(f"Adzuna [{kw}]: HTTP {r.status_code}")
                 continue
@@ -1401,7 +1598,7 @@ def scrape_jobs_ch_pw() -> list:
         )
         ctx = _new_stealth_context(browser)
         page = ctx.new_page()
-        for term in JOBS_CH_QUERIES:
+        for term in source_terms("jobs_ch", JOBS_CH_QUERIES):
             url = (f"https://www.jobs.ch/fr/offres-emplois/"
                    f"?term={quote(term)}&location={quote('Genève')}")
             try:
@@ -1676,6 +1873,7 @@ def scrape_educa() -> list:
     SÉLECTEUR À AJUSTER SI BESOIN : a[href*="/nos-offres/"].
     """
     jobs, seen_urls = [], set()
+    mark_raw_source("recrutement.hesge.ch")
     soup = fetch(HESGE_OFFERS_URL)
     if not soup:
         return jobs
@@ -1744,10 +1942,11 @@ def scrape_educh() -> list:
     """
     jobs, seen_urls = [], set()
     raw_links = 0
+    mark_raw_source("educh.ch")
     # Source principale : la page de recherche Genève (fonctionne, déjà ciblée).
-    # Les listings /emploi/<canton>/ renvoient une erreur serveur (Smarty) depuis
-    # 2026-06 ; on les conserve pour reprise auto si educh les répare. seen_urls
-    # dédoublonne et in_zone() (dans consider) assure le filtre géographique.
+    # Les listings /emploi/<canton>/ ont déjà renvoyé des erreurs serveur ; on les
+    # garde tant qu'ils répondent, car seen_urls dédoublonne et in_zone() assure le
+    # filtre géographique.
     for url in ("https://www.educh.ch/recherche/geneve.html",
                 "https://www.educh.ch/emploi/geneve-canton/",
                 "https://www.educh.ch/emploi/geneve-ville/"):
@@ -1862,13 +2061,14 @@ def update_health(source: str, count: int, health: dict,
     health[source] = entry
     if source in HEALTH_SILENT_SOURCES:
         return alerts          # suivi conservé, mais pas d'alerte (source en sommeil)
+    label = source_field or source
     # Source à extraction suivie (raw connu) : on se fie au compte BRUT, qui
     # distingue une vraie panne d'une simple absence d'offre pertinente. Détectable
     # dès le 1er run KO (pas besoin d'attendre N runs).
     if raw is not None:
         if raw == 0 and entry.get("raw_max", 0) > 0:
             alerts.append(
-                f"🚨 {source} : 0 candidat brut extrait (jusqu'à {entry['raw_max']} "
+                f"🚨 {label} : 0 candidat brut extrait (jusqu'à {entry['raw_max']} "
                 f"auparavant) — page/sélecteur probablement cassé."
             )
         # raw > 0 : la source fonctionne ; 0 offre PERTINENTE n'est pas une panne.
@@ -1877,13 +2077,13 @@ def update_health(source: str, count: int, health: dict,
     # Détection de panne : la source produisait régulièrement, et tombe à 0
     if count == 0 and entry["max"] >= 1 and avg_before >= 0.5 and entry["runs"] > 2:
         alerts.append(
-            f"🚨 {source} : 0 offre alors que la moyenne historique était "
+            f"🚨 {label} : 0 offre alors que la moyenne historique était "
             f"{avg_before:.1f} (max {entry['max']}). Sélecteur probablement cassé."
         )
     # Source chroniquement muette : n'a JAMAIS rien produit malgré plusieurs runs
     elif entry["max"] == 0 and entry["runs"] >= 5:
         alerts.append(
-            f"🔇 {source} : 0 offre depuis {entry['runs']} runs (jamais aucun "
+            f"🔇 {label} : 0 offre depuis {entry['runs']} runs (jamais aucun "
             f"résultat) — à déboguer ou repointer."
         )
     return alerts
@@ -1908,7 +2108,7 @@ def send_alert(new_jobs: list, health_alerts: list):
         parts.append("\n--- Alertes techniques ---")
         parts.extend(health_alerts)
     msg = MIMEText("\n".join(parts))
-    subject = f"[find_job] {len(new_jobs)} offre(s)"
+    subject = f"[find_job:{ACTIVE_PROFILE}] {len(new_jobs)} offre(s)"
     if health_alerts:
         subject += f" + {len(health_alerts)} alerte(s)"
     msg["Subject"] = subject
@@ -1977,7 +2177,7 @@ def generate_html(new_jobs: list, all_jobs: list):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Offres d'emploi – Lettres Modernes – Genève</title>
+<title>{escape(ACTIVE_PROFILE_CONFIG["title"])}</title>
 <style>
   body {{ font-family: Arial, sans-serif; max-width: 1200px; margin: 2rem auto;
           color: #222; padding: 0 1rem; }}
@@ -1996,7 +2196,7 @@ def generate_html(new_jobs: list, all_jobs: list):
 </style>
 </head>
 <body>
-<h1>Offres d'emploi – Lettres Modernes – Genève</h1>
+<h1>{escape(ACTIVE_PROFILE_CONFIG["title"])}</h1>
 <p class="updated">Dernière mise à jour : {now} · Tri par score de pertinence</p>
 
 <h2>Nouvelles offres <span class="badge">{len(new_jobs)}</span></h2>
@@ -2025,7 +2225,9 @@ def generate_rss(all_jobs: list):
             pub_dt = datetime.fromisoformat(j["found_at"])
         except (KeyError, ValueError):
             pub_dt = datetime.now()
-        pub_date = pub_dt.strftime("%a, %d %b %Y %H:%M:%S +0000")
+        # Les dates stockées sont locales et naïves ; astimezone() les convertit
+        # avec le fuseau système pour produire un offset RSS correct.
+        pub_date = pub_dt.astimezone().strftime("%a, %d %b %Y %H:%M:%S %z")
         items += (
             f"<item><title>{title}</title><link>{link}</link>"
             f"<pubDate>{pub_date}</pubDate>"
@@ -2036,13 +2238,50 @@ def generate_rss(all_jobs: list):
     rss = (
         "<?xml version='1.0' encoding='UTF-8'?>\n"
         "<rss version='2.0'><channel>"
-        "<title>Offres Lettres Modernes – Genève</title>"
-        "<link>https://gabigbarig.github.io/find_job/</link>"
-        "<description>Veille d'offres d'emploi</description>\n"
+        f"<title>{escape(ACTIVE_PROFILE_CONFIG['rss_title'])}</title>"
+        f"<link>{escape(profile_url(ACTIVE_PROFILE))}</link>"
+        f"<description>{escape(ACTIVE_PROFILE_CONFIG['description'])}</description>\n"
         f"{items}"
         "</channel></rss>"
     )
     RSS_FILE.write_text(rss, encoding="utf-8")
+
+
+def generate_portal_index():
+    """Page d'accueil GitHub Pages listant les profils disponibles."""
+    cards = []
+    for profile, cfg in PROFILES.items():
+        title = escape(cfg["title"])
+        desc = escape(cfg["description"])
+        url = escape(f"{profile}/")
+        cards.append(
+            f'<li><a href="{url}">{title}</a><p>{desc}</p></li>'
+        )
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veilles emploi – Genève</title>
+<style>
+  body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 2rem auto;
+          color: #222; padding: 0 1rem; }}
+  h1 {{ color: #1a56db; }}
+  ul {{ list-style: none; padding: 0; }}
+  li {{ border-bottom: 1px solid #e5e7eb; padding: 1rem 0; }}
+  a {{ color: #1a56db; font-weight: 700; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  p {{ color: #4b5563; margin: .35rem 0 0; }}
+</style>
+</head>
+<body>
+<h1>Veilles emploi – Genève et Nyon proche</h1>
+<ul>
+{''.join(cards)}
+</ul>
+</body>
+</html>"""
+    (DOCS_ROOT / "index.html").write_text(html, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -2077,14 +2316,28 @@ SCRAPERS = [
     scrape_indeed_pw, scrape_adzuna, scrape_jobs_ch_pw,
 ]
 
+SCRAPER_SOURCE_FIELDS = {
+    # Nom historique du scraper conservé, mais source réelle repointée.
+    "educa": "recrutement.hesge.ch",
+    "educh": "educh.ch",
+}
+
 # Sources rendues via Playwright : exécutées en séquence dans un seul thread (l'API
 # sync de Playwright ne supporte pas le parallélisme multi-thread), en parallèle du
 # pool HTTP. Voir la parallélisation dans main().
 PLAYWRIGHT_SCRAPERS = (scrape_myscience, scrape_indeed_pw, scrape_jobs_ch_pw)
 
 
-def main():
-    log("=== Démarrage de la recherche d'emploi ===")
+def run_profile(profile: str):
+    global _detail_fetch_count, _employer_fetch_count, _raw_counts
+    configure_profile(profile)
+    bootstrap_legacy_profile_data()
+    with _COUNTERS_LOCK:
+        _detail_fetch_count = 0
+        _employer_fetch_count = 0
+        _raw_counts = {}
+
+    log(f"=== Démarrage de la recherche d'emploi ({ACTIVE_PROFILE_CONFIG['label']}) ===")
     seen = load_seen()
     all_jobs = load_all_jobs()
     health = load_health()
@@ -2163,7 +2416,8 @@ def main():
         # source qui extrayait avant ; sinon None = pas de signal brut fiable (p. ex.
         # sources qui court-circuitent consider()).
         sf = (results[0].get("source") if results
-              else health.get(source_name, {}).get("source_field"))
+              else SCRAPER_SOURCE_FIELDS.get(source_name)
+              or health.get(source_name, {}).get("source_field"))
         had_raw = health.get(source_name, {}).get("raw_max", 0) > 0
         raw_n = (_raw_counts.get(sf, 0)
                  if (sf and (sf in _raw_counts or had_raw)) else None)
@@ -2207,6 +2461,9 @@ def main():
         log(f"Fusion doublons : {merged} offre(s) en double regroupée(s)")
     all_jobs = deduped
     new_jobs = [j for j in deduped if j.pop("_new", False)]
+    # Recalage final : `seen.json` doit refléter l'archive réellement publiée,
+    # après purge et fusion des doublons.
+    seen = {job_id(j["title"], j["url"]) for j in all_jobs}
 
     log(f"Nouvelles offres : {len(new_jobs)} | Total cumulé : {len(all_jobs)} "
         f"| Pages de détail lues : {_detail_fetch_count} "
@@ -2220,7 +2477,43 @@ def main():
     generate_html(new_jobs, all_jobs)
     generate_rss(all_jobs)
     send_alert(new_jobs, health_alerts)
-    log("=== Recherche terminée ===\n")
+    log(f"=== Recherche terminée ({ACTIVE_PROFILE_CONFIG['label']}) ===\n")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Scraper d'offres d'emploi par profil de recherche."
+    )
+    choices = sorted(PROFILES) + ["all"]
+    parser.add_argument(
+        "profile",
+        nargs="?",
+        choices=choices,
+        help="Profil à lancer : lettres, comptabilite ou all.",
+    )
+    parser.add_argument(
+        "-p", "--profile",
+        dest="profile_opt",
+        choices=choices,
+        help="Profil à lancer : lettres, comptabilite ou all.",
+    )
+    args = parser.parse_args(argv)
+    env_profile = os.environ.get("JOB_PROFILE")
+    profile = args.profile_opt or args.profile or env_profile or DEFAULT_PROFILE
+    if profile not in choices:
+        parser.error(f"profil inconnu: {profile}")
+    return profile
+
+
+def main(argv=None):
+    profile = parse_args(argv)
+    if profile == "all":
+        for name in PROFILES:
+            run_profile(name)
+        generate_portal_index()
+        return
+    run_profile(profile)
+    generate_portal_index()
 
 
 if __name__ == "__main__":
