@@ -1,0 +1,82 @@
+name: Recherche d'emploi
+
+on:
+  schedule:
+    - cron: "0 8,14,20 * * *"
+      timezone: Europe/Zurich
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: recherche-emploi
+  cancel-in-progress: false
+
+jobs:
+  rechercher-et-publier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ADZUNA_ID: ${{ secrets.ADZUNA_ID }}
+      ADZUNA_KEY: ${{ secrets.ADZUNA_KEY }}
+      SMTP_FROM: ${{ secrets.SMTP_FROM }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      SMTP_TO: ${{ secrets.SMTP_TO }}
+      LINKEDIN_IMAP_HOST: ${{ secrets.LINKEDIN_IMAP_HOST }}
+      LINKEDIN_IMAP_PORT: ${{ secrets.LINKEDIN_IMAP_PORT }}
+      LINKEDIN_IMAP_USER: ${{ secrets.LINKEDIN_IMAP_USER }}
+      LINKEDIN_IMAP_PASS: ${{ secrets.LINKEDIN_IMAP_PASS }}
+      LINKEDIN_IMAP_FOLDER: ${{ secrets.LINKEDIN_IMAP_FOLDER }}
+      LINKEDIN_ALERT_DEFAULT_LOCATION: ${{ secrets.LINKEDIN_ALERT_DEFAULT_LOCATION }}
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer les dépendances
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Restaurer l'historique de recherche
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: find-job-data-${{ github.run_id }}
+          restore-keys: |
+            find-job-data-
+
+      - name: Tester le filtrage
+        run: python -m unittest -v
+
+      - name: Rechercher les offres
+        run: python scraper.py --profile all
+
+      - name: Conserver l'historique de recherche
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: find-job-data-${{ github.run_id }}
+
+      - name: Publier les rapports GitHub Pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "Aucune modification à publier."
+          else
+            git commit -m "Mise à jour automatique des offres $(date '+%Y-%m-%d %H:%M')"
+            git push
+          fi

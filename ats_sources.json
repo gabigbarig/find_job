@@ -1,0 +1,26 @@
+{
+  "sources": [
+    {
+      "type": "workday",
+      "name": "Lombard Odier",
+      "source": "careers.lombardodier.com",
+      "host": "https://lombardodier.wd3.myworkdayjobs.com",
+      "tenant": "lombardodier",
+      "site": "lombard_odier_careers",
+      "public_base": "https://lombardodier.wd3.myworkdayjobs.com/en-US/lombard_odier_careers"
+    },
+    {
+      "type": "smartrecruiters",
+      "name": "Vitol",
+      "source": "careers.vitol.com",
+      "company_id": "Vitol"
+    },
+    {
+      "type": "smartrecruiters",
+      "name": "SQLI",
+      "source": "careers.sqli.com",
+      "company_id": "SQLI1",
+      "profiles": ["systemes"]
+    }
+  ]
+}
