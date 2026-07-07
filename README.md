@@ -52,7 +52,7 @@ mot de passe doit être un mot de passe d'application, pas celui du compte.
 ## Automatisation GitHub
 
 Le workflow `.github/workflows/recherche-emploi.yml` lance les trois profils à
-08:00, 14:00 et 20:00, heure de Genève, puis publie les changements de `docs/`.
+08:17, 14:17 et 20:17, heure de Genève, puis publie les changements de `docs/`.
 Il peut aussi être lancé manuellement depuis l'onglet **Actions**. L'historique
 contenu dans `data/` est conservé dans un cache GitHub sans être ajouté au dépôt.
 
