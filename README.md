@@ -21,9 +21,50 @@ Profils disponibles :
 ./publish.sh              # publie les trois rapports GitHub Pages
 ```
 
-Sources supplémentaires du profil `systemes` : SwissDevJobs, itjobs.ch,
-ITBoard, CERN, CICR, OMPI, Job-Room, SIG, TPG, ONU Genève et OMC. Job-Room,
-TPG et ONU Genève nécessitent Chromium/Playwright.
+Sources supplémentaires : ReliefWeb, CAGI et cinfoPoste pour la Genève
+internationale ; CERN, CICR, OMPI, SIG, TPG, ONU Genève et OMC sont aussi lus
+par les profils généralistes puis filtrés par métier. Sources réservées au
+profil `systemes` : SwissDevJobs, itjobs.ch, ITBoard et Job-Room. Job-Room,
+TPG et ONU Genève nécessitent Chromium/Playwright ; CAGI l'utilise seulement
+en repli si son listing HTML n'est pas accessible directement.
+
+Ubuntu 26.04 nécessite Playwright 1.61 ou plus récent. Mettre à niveau la
+bibliothèque, puis installer une fois son navigateur compatible :
+
+```bash
+./venv/bin/python3 -m pip install --upgrade "playwright>=1.61,<2"
+./venv/bin/python3 -m playwright install --with-deps chromium
+```
+
+Sous WSL, le lanceur Ubuntu `/usr/bin/chromium-browser` peut rediriger vers un
+paquet Snap qui ne fonctionne pas dans cet environnement. Le scraper l'ignore
+donc et privilégie le navigateur géré par Playwright. Un Chrome/Chromium natif
+peut aussi être indiqué avec `CHROMIUM_EXECUTABLE_PATH=/chemin/vers/chrome`.
+
+Le profil Lettres garde une sélection principale stricte Genève + Nyon proche.
+Les offres au métier pertinent mais au lieu incertain vont dans « Offres à
+vérifier ». Un lieu explicitement hors zone (autre canton, ville ou pays) est
+rejeté ; seuls les lieux réellement inconnus restent à confirmer. Un rappel
+élargi hebdomadaire ajoute aussi Lausanne/Gland/Rolle/Morges en revue uniquement.
+Il est actif le dimanche par défaut (`BROAD_RECALL_DAYS=6`), forçable avec
+`BROAD_RECALL=1` ou désactivable avec `BROAD_RECALL=0`.
+
+ReliefWeb exige depuis le 1er novembre 2025 un nom d'application pré-approuvé.
+La source reste donc désactivée tant que `RELIEFWEB_APPNAME` n'est pas défini
+avec une valeur approuvée par ReliefWeb ; le scraper ne tente pas de valeur
+factice qui produirait des erreurs HTTP 403.
+
+Les pages de détail sont enrichies après la collecte, en priorité lorsqu'elles
+permettent de confirmer le métier ou le lieu. Les fiches déjà lues sont gardées
+48 heures par défaut (`DETAIL_CACHE_TTL_HOURS`) et le cache est limité à 1 200
+entrées (`MAX_DETAIL_CACHE_ENTRIES`). Les liens archivés ne sont revérifiés que
+toutes les 24 heures par défaut (`DEAD_LINK_CHECK_TTL_HOURS`) afin d'éviter les
+requêtes inutiles. Les fichiers d'état sont écrits atomiquement et leur version
+précédente est conservée en secours.
+
+Un verrou commun empêche deux recherches d'écrire simultanément dans les
+rapports, y compris lors d'un lancement direct avec `python3 scraper.py`. Une
+seconde exécution est ignorée proprement pendant que la première travaille.
 
 LinkedIn n'est pas scanné : la plateforme interdit explicitement le scraping
 automatisé. Deux alternatives sont intégrées :
@@ -55,10 +96,13 @@ Le workflow `.github/workflows/recherche-emploi.yml` lance les trois profils à
 08:17, 14:17 et 20:17, heure de Genève, puis publie les changements de `docs/`.
 Il peut aussi être lancé manuellement depuis l'onglet **Actions**. L'historique
 contenu dans `data/` est conservé dans un cache GitHub sans être ajouté au dépôt.
+Un instantané JSON récupérable est également gardé 14 jours dans les artefacts
+de chaque exécution.
 
 Dans **Settings → Secrets and variables → Actions**, ajouter si nécessaire :
 
 - `ADZUNA_ID` et `ADZUNA_KEY` ;
+- `RELIEFWEB_APPNAME` uniquement après approbation par ReliefWeb ;
 - `SMTP_FROM`, `SMTP_PASS` et `SMTP_TO` ;
 - les cinq secrets `LINKEDIN_IMAP_*` présentés ci-dessus.
 
@@ -70,4 +114,6 @@ filtres et tri. Les favoris, candidatures envoyées et offres masquées sont
 conservés dans le navigateur ; l'export/import permet de transférer ce suivi.
 Les correspondances locales trop faibles pour la sélection principale sont
 conservées dans « Offres à vérifier ». La page `docs/status.html` expose la
-couverture des sources, les requêtes muettes et les motifs de rejet.
+couverture des sources, leur état, leur durée, leur dernier succès, les requêtes
+muettes et les motifs de rejet. Les principaux sélecteurs fragiles sont vérifiés
+hors réseau à partir des fixtures de `tests/fixtures/`.

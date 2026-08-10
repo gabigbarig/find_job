@@ -15,4 +15,4 @@ if ! flock -n 9; then
   exit 0
 fi
 
-"$VENV" scraper.py --profile "$PROFILE" >> data/scraper.log 2>&1
+FIND_JOB_LOCK_HELD=1 "$VENV" scraper.py --profile "$PROFILE" >> data/scraper.log 2>&1

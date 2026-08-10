@@ -15,7 +15,7 @@ if ! flock -n 9; then
   exit 1
 fi
 
-"$VENV" scraper.py --profile "$PROFILE"
+FIND_JOB_LOCK_HELD=1 "$VENV" scraper.py --profile "$PROFILE"
 
 if [ "$PROFILE" = "all" ]; then
   git add docs/index.html docs/status.html docs/assets docs/icon.svg docs/manifest.webmanifest docs/sw.js \

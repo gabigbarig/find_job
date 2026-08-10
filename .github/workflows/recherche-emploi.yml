@@ -20,6 +20,7 @@ jobs:
     env:
       ADZUNA_ID: ${{ secrets.ADZUNA_ID }}
       ADZUNA_KEY: ${{ secrets.ADZUNA_KEY }}
+      RELIEFWEB_APPNAME: ${{ secrets.RELIEFWEB_APPNAME }}
       SMTP_FROM: ${{ secrets.SMTP_FROM }}
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
       SMTP_TO: ${{ secrets.SMTP_TO }}
@@ -68,6 +69,22 @@ jobs:
         with:
           path: data
           key: find-job-data-${{ github.run_id }}
+
+      - name: Sauvegarder un état récupérable
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: find-job-state-${{ github.run_id }}
+          path: |
+            data/*/seen_jobs.json
+            data/*/all_jobs.json
+            data/*/review_jobs.json
+            data/*/health.json
+            data/*/query_coverage.json
+            data/*/rejections.json
+            data/*/detail_cache.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Publier les rapports GitHub Pages
         run: |

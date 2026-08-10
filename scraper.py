@@ -31,19 +31,25 @@ import shutil
 import socket
 import time
 import argparse
+import fcntl
 import hashlib
 import imaplib
 import smtplib
 import threading
 import unicodedata
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from email.mime.text import MIMEText
 from html import escape
 from pathlib import Path
-from urllib.parse import quote, urlparse, urljoin, urlunparse
+from typing import Callable, Literal, TypedDict
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urljoin, urlunparse
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -66,19 +72,140 @@ def _load_dotenv(path: Path):
 BASE_DIR = Path(__file__).parent
 _load_dotenv(BASE_DIR / ".env")
 
+LOCAL_TIMEZONE = ZoneInfo("Europe/Zurich")
+SCRAPER_LOCK_FILE = Path(os.environ.get("TMPDIR") or "/tmp") / (
+    f"find_job-scraper-{os.getuid()}.lock"
+)
+
+
+def local_now() -> datetime:
+    """Heure locale explicite, identique en WSL et dans GitHub Actions."""
+    return datetime.now(LOCAL_TIMEZONE)
+
+
+def parse_local_datetime(value: str) -> datetime:
+    """Lit une date ISO moderne ou historique et la ramène à Europe/Zurich."""
+    parsed = datetime.fromisoformat(str(value or ""))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TIMEZONE)
+    return parsed.astimezone(LOCAL_TIMEZONE)
+
+
+class Job(TypedDict, total=False):
+    """Schéma commun sérialisable utilisé par tous les adaptateurs de sources."""
+    title: str
+    url: str
+    company: str
+    employer: str
+    location: str
+    description: str
+    source: str
+    found_at: str
+    url_checked_at: str
+    date_posted: str
+    valid_through: str
+    employment_type: str
+    job_location_type: str
+    salary: str
+    external_id: str
+    posting_id: str
+    taux: str
+    score: int
+    review_reason: str
+
+
+class Decision(TypedDict):
+    destination: Literal["main", "review", "reject"]
+    reason: str
+    review_reasons: list[str]
+
+
+class ScraperAlreadyRunning(RuntimeError):
+    """Une autre exécution détient déjà le verrou global du projet."""
+
+
+@contextmanager
+def scraper_process_lock():
+    """Protège aussi les lancements directs qui contournent run.sh."""
+    if os.environ.get("FIND_JOB_LOCK_HELD") == "1":
+        yield
+        return
+    SCRAPER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SCRAPER_LOCK_FILE, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ScraperAlreadyRunning(
+                "Une recherche d'emploi est déjà en cours. Nouvelle exécution ignorée."
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class PlaywrightBrowserUnavailable(RuntimeError):
+    """Playwright est présent, mais aucun Chromium compatible n'est installé."""
+
+
+def _is_snap_chromium(path: str) -> bool:
+    """Détecte Chromium Snap et ses wrappers, incompatibles avec certains WSL."""
+    if not path:
+        return False
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        resolved = candidate
+    if (
+        str(candidate).startswith("/snap/")
+        or str(resolved).startswith("/snap/")
+        or resolved == Path("/usr/bin/snap")
+    ):
+        return True
+    try:
+        # Sur Ubuntu, /usr/bin/chromium-browser est un petit script qui délègue
+        # à /snap/bin/chromium. Lire uniquement les petits wrappers évite de
+        # charger un véritable exécutable Chromium en mémoire.
+        if candidate.is_file() and candidate.stat().st_size <= 64 * 1024:
+            wrapper = candidate.read_text(encoding="utf-8", errors="ignore")
+            return (
+                "/snap/bin/chromium" in wrapper
+                or "snap run chromium" in wrapper
+            )
+    except OSError:
+        pass
+    return False
+
+
+def _is_executable_file(path: str) -> bool:
+    return bool(path) and Path(path).is_file() and os.access(path, os.X_OK)
+
+
+def _find_system_chromium() -> str:
+    """Trouve un Chrome/Chromium natif en ignorant les lanceurs Snap."""
+    for executable in (
+        "google-chrome-stable", "google-chrome", "chromium", "chromium-browser",
+    ):
+        candidate = shutil.which(executable)
+        if (
+            candidate
+            and _is_executable_file(candidate)
+            and not _is_snap_chromium(candidate)
+        ):
+            return candidate
+    return ""
+
+
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
-    _CHROMIUM_PATH = (
-        shutil.which("chromium-browser")
-        or shutil.which("chromium")
-        or ("/snap/bin/chromium" if Path("/snap/bin/chromium").exists() else None)
-    )
+    _CHROMIUM_PATH = _find_system_chromium()
     # Playwright sait utiliser soit un Chromium système, soit le navigateur
     # installé par `python -m playwright install chromium` (cas GitHub Actions).
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-    _CHROMIUM_PATH = None
+    _CHROMIUM_PATH = ""
 
 # ---------------------------------------------------------------------------
 # Configuration (secrets chargés depuis l'environnement / .env)
@@ -104,6 +231,10 @@ LINKEDIN_IMAP_MAX_MESSAGES = int(os.environ.get("LINKEDIN_IMAP_MAX_MESSAGES", "1
 LINKEDIN_ALERT_DEFAULT_LOCATION = os.environ.get(
     "LINKEDIN_ALERT_DEFAULT_LOCATION", ""
 ).strip()
+# Depuis novembre 2025, ReliefWeb refuse les noms d'application non approuvés.
+# Ne jamais inventer de valeur par défaut : une configuration absente désactive
+# proprement la source au lieu de produire un 403 pour chaque terme recherché.
+RELIEFWEB_APPNAME = os.environ.get("RELIEFWEB_APPNAME", "").strip()
 
 RESPECT_ROBOTS = os.environ.get("RESPECT_ROBOTS", "1") not in ("0", "false", "False")
 EXPIRY_DAYS = int(os.environ.get("EXPIRY_DAYS", "60"))
@@ -130,6 +261,11 @@ ENABLE_INDEED = os.environ.get("ENABLE_INDEED", "0") not in ("0", "false", "Fals
 # Budget dédié à l'extraction de l'employeur (lecture des pages de détail des
 # offres nouvelles sans entreprise). Séparé pour ne pas concurrencer ci-dessus.
 MAX_EMPLOYER_FETCHES = int(os.environ.get("MAX_EMPLOYER_FETCHES", "40"))
+# Les fiches déjà lues restent réutilisables pendant une courte période. Cela
+# évite de consommer le quota sur les mêmes URL à chaque passage.
+DETAIL_CACHE_TTL_HOURS = int(os.environ.get("DETAIL_CACHE_TTL_HOURS", "48"))
+MAX_DETAIL_CACHE_ENTRIES = int(os.environ.get("MAX_DETAIL_CACHE_ENTRIES", "1200"))
+DEAD_LINK_CHECK_TTL_HOURS = int(os.environ.get("DEAD_LINK_CHECK_TTL_HOURS", "24"))
 
 DATA_ROOT = BASE_DIR / "data"
 DATA_ROOT.mkdir(exist_ok=True)
@@ -146,6 +282,7 @@ RSS_FILE = DOCS_DIR / "feed.xml"            # flux RSS en sortie (bonus)
 REVIEW_FILE = DATA_DIR / "review_jobs.json"
 REJECTIONS_FILE = DATA_DIR / "rejections.json"
 COVERAGE_FILE = DATA_DIR / "query_coverage.json"
+DETAIL_CACHE_FILE = DATA_DIR / "detail_cache.json"
 ATS_SOURCES_FILE = BASE_DIR / "ats_sources.json"
 
 USER_AGENT = (
@@ -160,6 +297,12 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 _SESSION_LOCAL = threading.local()
+_RUN_HTML_CACHE: dict[str, str] = {}
+_RUN_DEAD_URL_CACHE: dict[str, bool] = {}
+_RUN_CACHE_LOCK = threading.Lock()
+_RUN_CACHE_ENABLED = False
+MAX_RUN_HTML_CACHE_ENTRIES = 800
+MAX_RUN_HTML_BYTES = 2 * 1024 * 1024
 
 
 def session() -> requests.Session:
@@ -170,6 +313,93 @@ def session() -> requests.Session:
         sess.headers.update(HEADERS)
         _SESSION_LOCAL.session = sess
     return sess
+
+
+def _run_cached_html(url: str) -> str | None:
+    if not _RUN_CACHE_ENABLED:
+        return None
+    with _RUN_CACHE_LOCK:
+        return _RUN_HTML_CACHE.get(canonical_url(url))
+
+
+def _remember_run_html(url: str, html: str):
+    if not _RUN_CACHE_ENABLED or not html or len(html) > MAX_RUN_HTML_BYTES:
+        return
+    with _RUN_CACHE_LOCK:
+        if len(_RUN_HTML_CACHE) < MAX_RUN_HTML_CACHE_ENTRIES:
+            _RUN_HTML_CACHE.setdefault(canonical_url(url), html)
+
+
+@contextmanager
+def shared_run_cache():
+    """Mutualise les mêmes pages entre profils sans persistance inter-exécutions."""
+    global _RUN_CACHE_ENABLED
+    with _RUN_CACHE_LOCK:
+        _RUN_HTML_CACHE.clear()
+        _RUN_DEAD_URL_CACHE.clear()
+        _RUN_CACHE_ENABLED = True
+    try:
+        yield
+    finally:
+        with _RUN_CACHE_LOCK:
+            _RUN_CACHE_ENABLED = False
+            _RUN_HTML_CACHE.clear()
+            _RUN_DEAD_URL_CACHE.clear()
+
+
+def _backup_path(path: Path) -> Path:
+    return path.with_name(path.name + ".bak")
+
+
+def _atomic_write_text(path: Path, text: str, keep_backup: bool = False):
+    """Écrit un fichier d'un seul coup, sans laisser de contenu tronqué.
+
+    Le fichier temporaire est créé dans le même répertoire afin que os.replace()
+    reste atomique. Les fichiers d'état conservent en plus une copie précédente
+    lisible si une donnée logiquement corrompue devait être écrite.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if keep_backup and path.exists():
+            try:
+                json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+            else:
+                backup_temp = path.with_name(f".{path.name}.bak.tmp")
+                try:
+                    shutil.copy2(path, backup_temp)
+                    os.replace(backup_temp, _backup_path(path))
+                finally:
+                    backup_temp.unlink(missing_ok=True)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, value):
+    _atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        keep_backup=True,
+    )
+
+
+def _load_json_file(path: Path, default):
+    """Charge un JSON et se rabat sur la dernière copie valide si nécessaire."""
+    for candidate in (path, _backup_path(path)):
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+    return default
 
 # ---------------------------------------------------------------------------
 # Mots-clés et zones — ÉLARGIS (point 3)
@@ -300,7 +530,7 @@ LETTRES_KEYWORDS = [kw for kw in KEYWORDS if kw not in LETTRES_CONTEXTUAL_KEYWOR
 LETTRES_KEYWORDS.extend([
     "information documentaire", "assistant communication",
     "assistante communication", "communications manager", "communication manager",
-    "records manager", "social media coordinator", "editor", "editorial manager",
+    "social media coordinator", "editor", "editorial manager",
 ])
 LETTRES_EXCLUDE_KEYWORDS = EXCLUDE_KEYWORDS[:]
 LETTRES_SUBJECTS = LETTRES_SUBJECTS[:]
@@ -315,6 +545,12 @@ LETTRES_TITLE_EXCLUDE_KEYWORDS = [
     "enseignement général mathématiques", "enseignement général musique",
     "enseignement général géographie", "enseignement général droit",
     "enseignement général philosophie", "éducation nutritionnelle",
+    # Faux positifs fréquents des agrégateurs : contenu marketing/produit/vidéo
+    # et records management générique, trop éloignés d'un profil Lettres.
+    "content specialist", "creative content specialist",
+    "training content specialist", "retail watchmaking",
+    "watchmaking training", "video editor", "marketing video editor",
+    "ai marketing", "records manager",
 ]
 
 COMPTABILITE_KEYWORDS = [
@@ -413,7 +649,7 @@ LETTRES_SOURCE_TERMS = {
         "communication", "médiation culturelle", "médiateur culturel",
         "professeur français", "professeur de lettres", "assistant éditorial",
         "chargé de projet culturel", "chargé de médiation", "rédacteur technique",
-        "content specialist", "editorial assistant", "copywriter",
+        "editorial assistant", "copywriter",
         "proofreader", "information specialist", "knowledge manager",
         "communications officer", "publishing assistant", "library assistant",
     ]
@@ -544,7 +780,7 @@ PROFILES = {
         "subjects": LETTRES_SUBJECTS,
         "review_signals": [
             "editorial", "publishing", "proofreader", "library", "archives",
-            "records manager", "knowledge management", "information management",
+            "knowledge management", "information management",
             "communication manager", "communications manager", "social media coordinator",
             "humanities", "French teacher",
         ],
@@ -613,6 +849,31 @@ PROFILE_SOURCE_TERMS = {
     "comptabilite": COMPTABILITE_SOURCE_TERMS,
     "systemes": SYSTEMES_SOURCE_TERMS,
 }
+PROFILE_SOURCE_TERMS["lettres"].update({
+    "reliefweb": [
+        "communication", "communications", "editor", "editorial",
+        "knowledge management", "information management", "records management",
+        "publishing", "translation", "social media",
+    ],
+    "cagi": [
+        "communication", "communications", "editorial", "knowledge management",
+        "information management", "translation", "publications",
+    ],
+    "cinfo": [
+        "communication", "communications", "editorial", "knowledge management",
+        "information management", "translation", "publications",
+    ],
+})
+PROFILE_SOURCE_TERMS["comptabilite"].update({
+    "reliefweb": ["finance", "accounting", "accountant", "finance officer"],
+    "cagi": ["finance", "accounting", "accountant"],
+    "cinfo": ["finance", "accounting", "accountant"],
+})
+PROFILE_SOURCE_TERMS["systemes"].update({
+    "reliefweb": ["IT", "systems", "infrastructure", "linux"],
+    "cagi": ["IT", "systems", "infrastructure", "linux"],
+    "cinfo": ["IT", "systems", "infrastructure", "linux"],
+})
 
 
 def source_terms(source: str, default_terms: list) -> list:
@@ -638,6 +899,28 @@ GENEVE_ZONE = {
     "vandoeuvres", "puplinge", "presinge", "meinier",
     "collonge-bellerive", "hermance", "anières", "corsier", "céligny",
     "bellevue", "genthod", "versoix", "collex-bossy",
+    # Quartiers et localités fréquemment utilisés seuls par les portails.
+    "le lignon", "lignon", "châtelaine", "les avanchets", "avanchets",
+    "cointrin", "acacias", "champel", "eaux-vives", "plainpalais",
+    "servette", "petit-saconnex", "sécheron", "jonction", "vésenaz",
+}
+
+# Codes postaux suffisamment précis pour prouver l'appartenance à la zone. Les
+# codes vaudois restent limités aux communes déjà admises, sans élargir à tout VD.
+GENEVE_POSTCODES = set(range(1200, 1259)) | set(range(1290, 1299))
+VAUD_TARGET_POSTCODES = {
+    1260, 1262, 1263, 1266, 1270, 1271, 1272, 1274, 1277, 1279,
+}
+TARGET_POSTCODES = GENEVE_POSTCODES | VAUD_TARGET_POSTCODES
+
+FOREIGN_ISO_CODES = {
+    "us": "États-Unis", "fr": "France", "de": "Allemagne",
+    "it": "Italie", "at": "Autriche", "es": "Espagne",
+    "pt": "Portugal", "be": "Belgique", "nl": "Pays-Bas",
+    "gb": "Royaume-Uni", "uk": "Royaume-Uni", "ie": "Irlande",
+    "ca": "Canada", "ma": "Maroc", "dz": "Algérie", "tn": "Tunisie",
+    "sn": "Sénégal", "cn": "Chine", "jp": "Japon", "sg": "Singapour",
+    "in": "Inde", "au": "Australie", "br": "Brésil", "mx": "Mexique",
 }
 
 # ---------------------------------------------------------------------------
@@ -645,16 +928,30 @@ GENEVE_ZONE = {
 # ---------------------------------------------------------------------------
 
 _LOG_LOCK = threading.Lock()
+_SCRAPER_RUN_LOCAL = threading.local()
 
 
 def log(msg: str):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = local_now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
     # Verrou : évite l'entrelacement des lignes quand les scrapers tournent en parallèle.
     with _LOG_LOCK:
         print(line)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+    diagnostics = getattr(_SCRAPER_RUN_LOCAL, "diagnostics", None)
+    if diagnostics is not None:
+        msg_norm = normalize(msg)
+        disabled = any(marker in msg_norm for marker in (
+            "source ignoree", "identifiants absents", "configuration absente",
+        ))
+        if disabled:
+            _SCRAPER_RUN_LOCAL.status_hint = "disabled"
+            diagnostics.append(str(msg)[:500])
+        elif any(marker in msg_norm for marker in (
+            "erreur", "echoue", "inaccessible", "invalide", "introuvable",
+        )):
+            diagnostics.append(str(msg)[:500])
 
 
 def normalize(text: str) -> str:
@@ -715,6 +1012,7 @@ def configure_profile(profile: str):
     global KEYWORDS, EXCLUDE_KEYWORDS, MIN_SCORE
     global DATA_DIR, DOCS_DIR, SEEN_FILE, RESULTS_FILE, PUBLIC_FILE
     global LOG_FILE, HEALTH_FILE, RSS_FILE, REVIEW_FILE, REJECTIONS_FILE, COVERAGE_FILE
+    global DETAIL_CACHE_FILE
     global _KW_RE, _EXCLUDE_RE, _TITLE_EXCLUDE_RE, _SUBJECTS_RE, _REVIEW_RE
     global _DESC_ANCHOR_RE
 
@@ -747,6 +1045,7 @@ def configure_profile(profile: str):
     REVIEW_FILE = DATA_DIR / "review_jobs.json"
     REJECTIONS_FILE = DATA_DIR / "rejections.json"
     COVERAGE_FILE = DATA_DIR / "query_coverage.json"
+    DETAIL_CACHE_FILE = DATA_DIR / "detail_cache.json"
 
 
 def bootstrap_legacy_profile_data():
@@ -813,15 +1112,12 @@ _DE_COMMON = {
 
 
 def load_seen() -> set:
-    if SEEN_FILE.exists():
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+    value = _load_json_file(SEEN_FILE, [])
+    return set(value) if isinstance(value, list) else set()
 
 
 def save_seen(seen: set):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(seen), f, ensure_ascii=False, indent=2)
+    _atomic_write_json(SEEN_FILE, sorted(seen))
 
 
 def job_id(title: str, url: str) -> str:
@@ -829,8 +1125,26 @@ def job_id(title: str, url: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def legacy_job_id(title: str, url: str) -> str:
+    """Identité utilisée avant le nettoyage des paramètres, pour migrer le suivi."""
+    raw = str(url or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        path = re.sub(r"/+$", "", parsed.path) or "/"
+        raw = urlunparse((
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            "",
+            parsed.query,
+            "",
+        ))
+    raw = raw or title.lower().strip()
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
 def canonical_url(url: str) -> str:
-    """URL stable pour identifier une offre malgré les variations de titre."""
+    """URL stable, sans suivi ; conserve les fragments qui identifient une offre."""
     raw = str(url or "").strip()
     if not raw:
         return ""
@@ -838,14 +1152,65 @@ def canonical_url(url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return raw
     path = re.sub(r"/+$", "", parsed.path) or "/"
+    tracking_keys = {
+        "fbclid", "gclid", "mc_cid", "mc_eid", "referrer", "sourceid",
+        "trackingid", "trk", "trkemail", "ghsrc", "campaign",
+    }
+    query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key_norm = normalize(key).replace("-", "").replace("_", "")
+        if key_norm.startswith("utm") or key_norm in tracking_keys:
+            continue
+        query.append((key, value))
+    query.sort(key=lambda item: (item[0].lower(), item[1]))
+    # Certains portails SPA (notamment l'État de Vaud) mettent l'identifiant
+    # d'offre uniquement après « # ». Le supprimer fusionnerait toutes les fiches.
+    fragment = parsed.fragment if re.search(
+        r"(?:^|/)(?:job|jobs|offre|posting)/", parsed.fragment, re.I
+    ) else ""
     return urlunparse((
         parsed.scheme.lower(),
         parsed.netloc.lower(),
         path,
         "",
-        parsed.query,
-        "",
+        urlencode(query, doseq=True),
+        fragment,
     ))
+
+
+def posting_identity(job: dict) -> str:
+    """Identifiant ATS stable, séparé par portail pour éviter les collisions."""
+    external_id = str(
+        job.get("external_id") or job.get("posting_id") or ""
+    ).strip()
+    parsed = urlparse(job.get("url", ""))
+    if not external_id:
+        query = {key.lower(): value for key, value in parse_qsl(parsed.query)}
+        for key in ("jobid", "job_id", "postingid", "requisitionid", "reqid"):
+            if query.get(key):
+                external_id = query[key]
+                break
+    if not external_id:
+        return ""
+    host = normalize(parsed.netloc)
+    namespace = normalize(job.get("source", "") or job_employer(job))
+    owner = f"{host}|{namespace}" if host else namespace
+    return f"{owner}|{normalize(external_id)}"
+
+
+def tracking_id(job: dict) -> str:
+    """Identité de suivi stable même si une URL de diffusion change."""
+    stable_posting = posting_identity(job)
+    if stable_posting:
+        raw = f"posting|{stable_posting}"
+    else:
+        employer = normalize(job_employer(job))
+        location = normalize(display_location(job.get("location", "")))
+        title = title_fingerprint(job.get("title", ""))
+        raw = f"content|{employer}|{title}|{location}"
+        if not employer:
+            raw += f"|{urlparse(canonical_url(job.get('url', ''))).netloc}"
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
 def relevance_score(title: str, description: str = "") -> int:
@@ -959,21 +1324,32 @@ def title_is_ambiguous(title: str) -> bool:
 
 
 def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
-    cutoff = datetime.now() - timedelta(days=EXPIRY_DAYS)
+    now = local_now()
+    cutoff = now - timedelta(days=EXPIRY_DAYS)
     fresh, expired_ids = [], set()
     for j in all_jobs:
         try:
-            found_at = datetime.fromisoformat(j["found_at"])
-        except (KeyError, ValueError):
+            found_at = parse_local_datetime(j["found_at"])
+        except (KeyError, TypeError, ValueError):
             fresh.append(j)
             continue
-        if found_at >= cutoff:
+        valid_through = j.get("valid_through", "")
+        expired_by_source = False
+        if valid_through:
+            try:
+                expired_by_source = parse_local_datetime(valid_through).date() < now.date()
+            except (TypeError, ValueError):
+                pass
+        if found_at >= cutoff and not expired_by_source:
             fresh.append(j)
         else:
             expired_ids.add(job_id(j["title"], j["url"]))
     removed = len(all_jobs) - len(fresh)
     if removed:
-        log(f"Expiration : {removed} offre(s) de plus de {EXPIRY_DAYS} jours retirées")
+        log(
+            f"Expiration : {removed} offre(s) retirée(s) "
+            f"(ancienneté supérieure à {EXPIRY_DAYS} jours ou échéance dépassée)"
+        )
     return fresh, seen - expired_ids
 
 
@@ -1109,6 +1485,9 @@ def fetch(url: str, retries: int = 3):
     Les erreurs permanentes (DNS mort, 403, 404) coupent court : pas de retry.
     Les vraies erreurs transitoires (timeout, 5xx) gardent les tentatives + back-off.
     """
+    cached_html = _run_cached_html(url)
+    if cached_html is not None:
+        return BeautifulSoup(cached_html, "lxml")
     if not robots_allows(url):
         log(f"robots.txt interdit : {url} — ignoré")
         return None
@@ -1121,6 +1500,7 @@ def fetch(url: str, retries: int = 3):
             if err:
                 log(f"⚠️  {url} : page d'erreur serveur ({err}) — traitée comme échec")
                 return None
+            _remember_run_html(url, r.text)
             return BeautifulSoup(r.text, "lxml")
         except Exception as e:
             if _is_permanent_error(e):
@@ -1139,6 +1519,12 @@ def url_is_dead(url: str) -> bool:
     offre sur un simple aléa transitoire (mieux vaut un lien douteux qu'en perdre
     un valide). Sert à retirer de l'archive les liens devenus morts.
     """
+    cache_key = canonical_url(url)
+    if _RUN_CACHE_ENABLED:
+        with _RUN_CACHE_LOCK:
+            cached = _RUN_DEAD_URL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
     if not host_resolves(url):
         return False
     try:
@@ -1147,15 +1533,34 @@ def url_is_dead(url: str) -> bool:
         if r.status_code == 405:           # HEAD refusé : on retente en GET léger
             _polite_wait(url)
             r = session().get(url, timeout=15)
-        return r.status_code in (404, 410)
+        dead = r.status_code in (404, 410)
+        if _RUN_CACHE_ENABLED:
+            with _RUN_CACHE_LOCK:
+                _RUN_DEAD_URL_CACHE[cache_key] = dead
+        return dead
     except Exception:
         return False
+
+
+def dead_link_check_due(job: Job) -> bool:
+    checked_at = job.get("url_checked_at", "")
+    if not checked_at:
+        return True
+    try:
+        age = local_now() - parse_local_datetime(checked_at)
+    except (TypeError, ValueError):
+        return True
+    return age >= timedelta(hours=max(1, DEAD_LINK_CHECK_TTL_HOURS))
 
 
 # --- Compteurs globaux de fetches de détail (garde-fous séparés) ---
 _detail_fetch_count = 0      # lecture des titres ambigus (consider)
 _employer_fetch_count = 0    # extraction de l'employeur (déduplication)
 _COUNTERS_LOCK = threading.Lock()
+_DETAIL_CACHE_LOCK = threading.Lock()
+_detail_fields_cache: dict = {}
+_DEFER_DETAIL_FETCHES = False
+_pending_detail_candidates: list = []
 
 # Canari d'extraction : nb de candidats BRUTS passés au funnel par source (clé =
 # champ « source », ex. "educh.ch"). Remis à zéro au début de main(). Distingue
@@ -1164,12 +1569,19 @@ _raw_counts: dict = {}
 _query_counts: dict = {}
 _rejection_counts: dict = {}
 _rejection_samples: dict = {}
+_rejection_by_source: dict = {}
 
 
 def mark_raw_source(source: str):
     """Initialise le compteur brut d'une source, même si tous les candidats filtrent."""
     with _COUNTERS_LOCK:
         _raw_counts.setdefault(source, 0)
+
+
+def record_raw_candidate(source: str):
+    """Compte une carte/API extraite avant les filtres de métier et de lieu."""
+    with _COUNTERS_LOCK:
+        _raw_counts[source] = _raw_counts.get(source, 0) + 1
 
 
 def mark_query(source: str, query: str):
@@ -1188,14 +1600,17 @@ def record_query_candidate(source: str, query: str):
 def record_rejection(reason: str, job: dict):
     """Agrège les rejets sans saturer le journal quotidien."""
     reason = reason or "inconnu"
+    source = job.get("source", "?")
     sample = {
         "title": clean_job_title(job.get("title", ""))[:140],
-        "source": job.get("source", "?"),
+        "source": source,
         "location": job.get("location", ""),
         "url": job.get("url", ""),
     }
     with _COUNTERS_LOCK:
         _rejection_counts[reason] = _rejection_counts.get(reason, 0) + 1
+        source_counts = _rejection_by_source.setdefault(source, {})
+        source_counts[reason] = source_counts.get(reason, 0) + 1
         samples = _rejection_samples.setdefault(reason, [])
         if len(samples) < 5 and sample not in samples:
             samples.append(sample)
@@ -1203,21 +1618,22 @@ def record_rejection(reason: str, job: dict):
 
 def save_rejection_report():
     report = {
-        "updated_at": datetime.now().isoformat(),
+        "updated_at": local_now().isoformat(),
         "profile": ACTIVE_PROFILE,
         "counts": dict(sorted(_rejection_counts.items())),
+        "by_source": {
+            source: dict(sorted(counts.items()))
+            for source, counts in sorted(_rejection_by_source.items())
+        },
         "samples": _rejection_samples,
     }
-    REJECTIONS_FILE.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    _atomic_write_json(REJECTIONS_FILE, report)
 
 
 def update_query_coverage() -> list:
     """Mémorise les requêtes muettes et alerte seulement après une vraie régression."""
-    try:
-        coverage = json.loads(COVERAGE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    coverage = _load_json_file(COVERAGE_FILE, {})
+    if not isinstance(coverage, dict):
         coverage = {}
     alerts = []
     for key, count in sorted(_query_counts.items()):
@@ -1226,7 +1642,7 @@ def update_query_coverage() -> list:
         entry["last"] = count
         entry["max"] = max(entry.get("max", 0), count)
         entry["zero_runs"] = entry.get("zero_runs", 0) + 1 if count == 0 else 0
-        entry["updated_at"] = datetime.now().isoformat()
+        entry["updated_at"] = local_now().isoformat()
         coverage[key] = entry
         if count == 0 and entry["max"] >= 3 and entry["zero_runs"] == 2:
             source, query = key.split("::", 1)
@@ -1234,9 +1650,7 @@ def update_query_coverage() -> list:
                 f"🔎 {source} / « {query} » : aucun candidat brut depuis 2 recherches "
                 f"(jusqu'à {entry['max']} auparavant)."
             )
-    COVERAGE_FILE.write_text(
-        json.dumps(coverage, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    _atomic_write_json(COVERAGE_FILE, coverage)
     return alerts
 
 
@@ -1265,8 +1679,8 @@ def sanitize_description(text: str, expected_title: str = "") -> str:
     return value[:5000] if len(value) >= 40 else ""
 
 
-def _json_ld_job_description(soup: BeautifulSoup) -> str:
-    """Description structurée schema.org, préférable au texte visible bruité."""
+def _json_ld_job_fields(soup: BeautifulSoup) -> dict:
+    """Champs JobPosting structurés, préférables au texte visible bruité."""
     def find_jobposting(value):
         if isinstance(value, list):
             for item in value:
@@ -1276,33 +1690,136 @@ def _json_ld_job_description(soup: BeautifulSoup) -> str:
         elif isinstance(value, dict):
             kind = value.get("@type", "")
             kinds = kind if isinstance(kind, list) else [kind]
-            if "JobPosting" in kinds and value.get("description"):
-                return value["description"]
+            if any("JobPosting" in str(item) for item in kinds):
+                return value
             for item in value.values():
                 found = find_jobposting(item)
                 if found:
                     return found
         return ""
 
+    def first_text(value) -> str:
+        if isinstance(value, list):
+            return first_text(value[0]) if value else ""
+        if isinstance(value, dict):
+            for key in ("name", "text", "value"):
+                if value.get(key):
+                    return str(value[key]).strip()
+            return ""
+        return str(value or "").strip()
+
+    def location_text(value) -> str:
+        if isinstance(value, list):
+            parts = [location_text(item) for item in value]
+            return ", ".join(part for part in parts if part)
+        if not isinstance(value, dict):
+            return first_text(value)
+        address = value.get("address")
+        if isinstance(address, dict):
+            parts = [
+                first_text(address.get(key))
+                for key in (
+                    "streetAddress", "addressLocality", "addressRegion",
+                    "postalCode", "addressCountry",
+                )
+            ]
+            joined = ", ".join(part for part in parts if part)
+            if joined:
+                return joined
+        return first_text(value)
+
+    def joined_text(value) -> str:
+        if isinstance(value, list):
+            return ", ".join(filter(None, (first_text(item) for item in value)))
+        return first_text(value)
+
+    def identifier_text(value) -> str:
+        if isinstance(value, dict):
+            return str(value.get("value") or value.get("propertyID") or "").strip()
+        return first_text(value)
+
+    def salary_text(value) -> str:
+        if not isinstance(value, dict):
+            return first_text(value)
+
+        def amount_text(amount) -> str:
+            raw = first_text(amount)
+            try:
+                number = float(raw)
+            except (TypeError, ValueError):
+                return raw
+            if number.is_integer():
+                return f"{int(number):,}".replace(",", " ")
+            return f"{number:g}".replace(".", ",")
+
+        currency = first_text(value.get("currency"))
+        amount = value.get("value", value)
+        if isinstance(amount, dict):
+            minimum = amount_text(amount.get("minValue"))
+            maximum = amount_text(amount.get("maxValue"))
+            unit = {
+                "YEAR": "/an", "MONTH": "/mois", "WEEK": "/semaine",
+                "DAY": "/jour", "HOUR": "/heure",
+            }.get(first_text(amount.get("unitText")).upper(), "")
+            numbers = "–".join(part for part in (minimum, maximum) if part)
+            return " ".join(part for part in (numbers, currency) if part) + unit
+        return " ".join(part for part in (amount_text(amount), currency) if part)
+
     for script in soup.select('script[type="application/ld+json"]'):
         try:
-            description = find_jobposting(json.loads(script.string or script.get_text()))
+            posting = find_jobposting(json.loads(script.string or script.get_text()))
         except (json.JSONDecodeError, TypeError):
             continue
-        if description:
-            return str(description)
+        if posting:
+            return {
+                "description": str(posting.get("description", "") or ""),
+                "location": location_text(posting.get("jobLocation")),
+                "company": first_text(posting.get("hiringOrganization")),
+                "date_posted": first_text(posting.get("datePosted")),
+                "valid_through": first_text(posting.get("validThrough")),
+                "employment_type": joined_text(posting.get("employmentType")),
+                "job_location_type": joined_text(posting.get("jobLocationType")),
+                "external_id": identifier_text(posting.get("identifier")),
+                "salary": salary_text(posting.get("baseSalary")),
+            }
+    return {}
+
+
+def _json_ld_job_description(soup: BeautifulSoup) -> str:
+    """Description structurée schema.org, préférable au texte visible bruité."""
+    return _json_ld_job_fields(soup).get("description", "")
+
+
+_LOCATION_LABEL_RE = re.compile(
+    r"\b(?:lieu de travail|localisation|location|work location|duty station|"
+    r"job location|standort|arbeitsort)\s*[:\-]\s*([^|•\n\r]{2,140})",
+    re.IGNORECASE,
+)
+
+
+def extract_location_hint(text: str) -> str:
+    """Extrait un indice de lieu depuis une fiche, sans inventer de localisation."""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    match = _LOCATION_LABEL_RE.search(value)
+    if match:
+        location = match.group(1).strip(" ,;:.")
+        if location and len(location) <= 140:
+            return location
+    norm = normalize(value[:2500])
+    if term_in(norm, _GEO_OK_RE):
+        places = [place for place in sorted(GEO_OK, key=len, reverse=True)
+                  if re.search(rf"\b{re.escape(normalize(place))}\b", norm)]
+        if places:
+            return places[0].title()
     return ""
 
 
-def _page_text(url: str, expected_title: str = "") -> str:
-    """Récupère uniquement le corps utile d'une fiche d'emploi."""
+def _page_fields(url: str, expected_title: str = "") -> dict:
+    """Récupère le corps utile d'une fiche et quelques métadonnées stables."""
     soup = fetch(url, retries=2)
     if not soup:
-        return ""
-    structured = _json_ld_job_description(soup)
-    if structured:
-        return sanitize_description(structured, expected_title)
-    # On retire les éléments non pertinents puis on extrait le texte visible
+        return {}
+    structured = _json_ld_job_fields(soup)
     for tag in soup(["script", "style", "nav", "header", "footer"]):
         tag.decompose()
     main = (
@@ -1310,7 +1827,106 @@ def _page_text(url: str, expected_title: str = "") -> str:
                         '.job-description, #job-description')
         or soup.find("article") or soup.find("main") or soup.body or soup
     )
-    return sanitize_description(main.get_text(" ", strip=True), expected_title)
+    visible_text = main.get_text(" ", strip=True)
+    description = sanitize_description(
+        structured.get("description", "") or visible_text, expected_title
+    )
+    location = structured.get("location", "") or extract_location_hint(visible_text)
+    company = structured.get("company", "") or extract_employer(visible_text)
+    return {
+        **structured,
+        "description": description,
+        "location": location,
+        "company": company,
+    }
+
+
+def _page_text(url: str, expected_title: str = "") -> str:
+    """Récupère uniquement le corps utile d'une fiche d'emploi."""
+    return _page_fields(url, expected_title).get("description", "")
+
+
+def _load_detail_cache():
+    global _detail_fields_cache
+    raw = _load_json_file(DETAIL_CACHE_FILE, {})
+    now = local_now()
+    fresh = {}
+    if isinstance(raw, dict):
+        for url, entry in raw.items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("fields"), dict):
+                continue
+            try:
+                fetched_at = parse_local_datetime(entry.get("fetched_at", ""))
+            except (TypeError, ValueError):
+                continue
+            if now - fetched_at <= timedelta(hours=max(1, DETAIL_CACHE_TTL_HOURS)):
+                fresh[canonical_url(url)] = entry
+    with _DETAIL_CACHE_LOCK:
+        _detail_fields_cache = fresh
+
+
+def _cached_detail_fields(url: str):
+    key = canonical_url(url)
+    with _DETAIL_CACHE_LOCK:
+        entry = _detail_fields_cache.get(key)
+    if not entry:
+        return None
+    try:
+        fetched_at = parse_local_datetime(entry.get("fetched_at", ""))
+    except (TypeError, ValueError):
+        return None
+    if local_now() - fetched_at > timedelta(hours=max(1, DETAIL_CACHE_TTL_HOURS)):
+        with _DETAIL_CACHE_LOCK:
+            _detail_fields_cache.pop(key, None)
+        return None
+    fields = entry.get("fields")
+    return dict(fields) if isinstance(fields, dict) else None
+
+
+def _cache_detail_fields(url: str, fields: dict):
+    if not fields:
+        return
+    key = canonical_url(url)
+    if not key:
+        return
+    with _DETAIL_CACHE_LOCK:
+        _detail_fields_cache[key] = {
+            "fetched_at": local_now().isoformat(),
+            "fields": {
+                name: str(fields.get(name, ""))
+                for name in (
+                    "description", "location", "company", "date_posted",
+                    "valid_through", "employment_type", "job_location_type",
+                    "external_id", "salary",
+                )
+                if fields.get(name)
+            },
+        }
+
+
+def _save_detail_cache():
+    with _DETAIL_CACHE_LOCK:
+        entries = sorted(
+            _detail_fields_cache.items(),
+            key=lambda item: item[1].get("fetched_at", ""),
+            reverse=True,
+        )[:max(1, MAX_DETAIL_CACHE_ENTRIES)]
+    _atomic_write_json(DETAIL_CACHE_FILE, dict(entries))
+
+
+def fetch_detail_fields(url: str, expected_title: str = "") -> dict:
+    """Description + lieu + employeur, dans le même quota que fetch_description()."""
+    global _detail_fetch_count
+    cached = _cached_detail_fields(url)
+    if cached is not None:
+        return cached
+    with _COUNTERS_LOCK:
+        if not FETCH_DESCRIPTIONS or _detail_fetch_count >= MAX_DETAIL_FETCHES:
+            return {}
+        _detail_fetch_count += 1
+    fields = _page_fields(url, expected_title)
+    _cache_detail_fields(url, fields)
+    return fields
 
 
 def fetch_description(url: str, expected_title: str = "") -> str:
@@ -1319,12 +1935,7 @@ def fetch_description(url: str, expected_title: str = "") -> str:
     Respecte MAX_DETAIL_FETCHES pour ne pas exploser le nombre de requêtes.
     Retourne "" si désactivé, quota atteint, ou échec.
     """
-    global _detail_fetch_count
-    with _COUNTERS_LOCK:
-        if not FETCH_DESCRIPTIONS or _detail_fetch_count >= MAX_DETAIL_FETCHES:
-            return ""
-        _detail_fetch_count += 1
-    return _page_text(url, expected_title)
+    return fetch_detail_fields(url, expected_title).get("description", "")
 
 
 def fetch_employer_page(url: str) -> str:
@@ -1334,11 +1945,16 @@ def fetch_employer_page(url: str) -> str:
     ambigus, pour ne pas gonfler le volume de requêtes du scraping lui-même.
     """
     global _employer_fetch_count
+    cached = _cached_detail_fields(url)
+    if cached is not None:
+        return cached.get("description", "")
     with _COUNTERS_LOCK:
         if _employer_fetch_count >= MAX_EMPLOYER_FETCHES:
             return ""
         _employer_fetch_count += 1
-    return _page_text(url)
+    fields = _page_fields(url)
+    _cache_detail_fields(url, fields)
+    return fields.get("description", "")
 
 
 def extract_taux(text: str) -> str:
@@ -1353,7 +1969,7 @@ def extract_taux(text: str) -> str:
 
 
 def _warn_if_empty(source: str, jobs: list, expect_results: bool = True):
-    if expect_results and not jobs:
+    if expect_results and not jobs and _pending_detail_count(source) == 0:
         log(f"⚠️  {source}: 0 offre — sélecteur potentiellement cassé ou source bloquée")
 
 
@@ -1390,11 +2006,11 @@ def passes_filters(job: dict) -> bool:
     title = job.get("title", "")
     if not is_french_text(title) or not strict_title_match(title):
         return False
-    # Lieu hors-zone mentionné dans le TITRE (ex. « … Musée Jenisch Vevey ») :
-    # in_zone ne regarde que lieu+description, on couvre donc aussi le titre.
-    if term_in(normalize(title), _GEO_FAR_RE):
+    # Un lieu explicite hors zone dans le titre, le champ lieu ou un
+    # « Duty Station » structuré est bloquant, y compris pour l'archive.
+    if job_has_far_location(job):
         return False
-    if not in_zone(job.get("location", ""), title):
+    if not job_in_zone(job):
         return False
     return True
 
@@ -1524,6 +2140,16 @@ def matched_keywords(job: dict, limit: int = 8) -> list:
 
 def job_contract(job: dict) -> str:
     """Extrait uniquement les types de contrat explicitement indiqués."""
+    structured = str(job.get("employment_type", "") or "").strip()
+    if structured:
+        labels = {
+            "full_time": "Temps plein", "fulltime": "Temps plein",
+            "part_time": "Temps partiel", "parttime": "Temps partiel",
+            "temporary": "Temporaire", "contractor": "Contrat",
+            "intern": "Stage", "internship": "Stage",
+        }
+        key = normalize(structured).replace("-", "_").replace(" ", "_")
+        return labels.get(key, structured)
     text = f"{job.get('title', '')} {job.get('description', '')}"
     labelled = re.search(
         r"(?:type de contrat|contrat)\s*[:\-]\s*(CDI|CDD|stage|temporaire|apprentissage)",
@@ -1541,6 +2167,12 @@ def job_contract(job: dict) -> str:
 
 def job_deadline(job: dict) -> str:
     """Extrait une échéance quand la fiche contient un libellé non ambigu."""
+    structured = str(job.get("valid_through", "") or "").strip()
+    if structured:
+        try:
+            return parse_local_datetime(structured).strftime("%d.%m.%Y")
+        except (TypeError, ValueError):
+            pass
     text = job.get("description", "")
     match = re.search(
         r"(?:d[eé]lai d['’]inscription|date limite(?: de candidature)?)\s*:\s*"
@@ -1551,8 +2183,21 @@ def job_deadline(job: dict) -> str:
     return match.group(1) if match else ""
 
 
+def job_posted_date(job: dict) -> str:
+    """Formate la date de publication fournie par schema.org, si elle est valide."""
+    structured = str(job.get("date_posted", "") or "").strip()
+    if not structured:
+        return ""
+    try:
+        return parse_local_datetime(structured).strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return ""
+
+
 def job_work_mode(job: dict) -> str:
     """Détecte un mode de travail seulement lorsqu'il est formulé explicitement."""
+    if "telecommute" in normalize(job.get("job_location_type", "")):
+        return "Télétravail"
     text = f"{job.get('title', '')} {job.get('description', '')[:1200]}"
     if re.search(r"(?:mode de travail|work mode)\s*[:\-]\s*hybride", text, re.I):
         return "Hybride"
@@ -1567,7 +2212,15 @@ def title_fingerprint(title: str) -> str:
     « Greffier-ère », « Greffier·ère », « Greffier/ère » → même empreinte.
     Sert à fusionner les ré-publications d'une même offre.
     """
-    stable = normalize(clean_job_title(title))
+    stable = clean_job_title(title)
+    # Les plateformes placent souvent le genre puis le taux à la fin, dans des
+    # ordres différents : « F/H (100 %) » et « 100% H/F » restent la même offre.
+    stable = re.sub(
+        r"\b[FMHDWX]\s*(?:[/.\-]\s*[FMHDWX])+\b", " ", stable,
+        flags=re.IGNORECASE,
+    )
+    stable = re.sub(r"\(?\s*\d{1,3}\s*%\s*\)?", " ", stable)
+    stable = normalize(stable)
     stable = re.sub(r"\b\d+\s+vues?\b", " ", stable)
     stable = _TITLE_GENDER_SUFFIX_RE.sub("", stable)
     stable = _TITLE_LOCATION_SUFFIX_RE.sub("", stable)
@@ -1575,7 +2228,44 @@ def title_fingerprint(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", stable)
 
 
-def is_duplicate(job: dict, fp_to_known: dict, seen_urls: set | None = None) -> bool:
+_MULTILINGUAL_TITLE_CONCEPTS = {
+    "consultant": _compile_terms(
+        ["consultant", "consultante", "berater", "beraterin", "consulente"],
+        inflect=False,
+    ),
+    "kubernetes": _compile_terms(["kubernetes"], inflect=False),
+    "banking": _compile_terms(
+        ["domaine bancaire", "bankwesen", "settore bancario"],
+        inflect=False,
+    ),
+}
+
+
+def multilingual_title_fingerprint(title: str) -> str:
+    """Empreinte sémantique volontairement étroite pour traductions évidentes."""
+    norm = normalize(clean_job_title(title))
+    concepts = {
+        concept for concept, patterns in _MULTILINGUAL_TITLE_CONCEPTS.items()
+        if term_in(norm, patterns)
+    }
+    if "consultant" not in concepts or "kubernetes" not in concepts:
+        return ""
+    return "|".join(sorted(concepts))
+
+
+def employer_fingerprint(value: str) -> str:
+    """Normalise les formes juridiques sans confondre les noms eux-mêmes."""
+    stable = normalize(value)
+    stable = re.sub(
+        r"\b(?:sa|ag|sarl|sàrl|gmbh|ltd|limited|inc|corp|corporation)\b",
+        " ",
+        stable,
+    )
+    return re.sub(r"[^a-z0-9]+", "", stable)
+
+
+def is_duplicate(job: dict, fp_to_known: dict, seen_urls: set | None = None,
+                 seen_postings: set | None = None) -> bool:
     """Vrai si `job` est un doublon d'une offre déjà retenue.
 
     Une URL d'offre identique est toujours un doublon, même si la source change
@@ -1591,18 +2281,36 @@ def is_duplicate(job: dict, fp_to_known: dict, seen_urls: set | None = None) -> 
     url_key = canonical_url(job.get("url", ""))
     if seen_urls is not None and url_key in seen_urls:
         return True
-    fp = title_fingerprint(job.get("title", ""))
-    emp = normalize(job_employer(job))
+    fp = multilingual_title_fingerprint(job.get("title", ""))
+    fp = f"multi:{fp}" if fp else title_fingerprint(job.get("title", ""))
+    emp = employer_fingerprint(job_employer(job))
+    posting_key = posting_identity(job)
+    if seen_postings is not None and posting_key:
+        if posting_key in seen_postings:
+            return True
+        # Un identifiant ATS distinct est une preuve plus forte qu'un titre
+        # identique : deux réquisitions du même employeur doivent rester visibles.
+        seen_postings.add(posting_key)
+        if seen_urls is not None and url_key:
+            seen_urls.add(url_key)
+        known = fp_to_known.setdefault(fp, set())
+        if emp:
+            known.add(emp)
+        return False
     known = fp_to_known.get(fp)
     if known is None:
         fp_to_known[fp] = {emp} if emp else set()
         if seen_urls is not None and url_key:
             seen_urls.add(url_key)
+        if seen_postings is not None and posting_key:
+            seen_postings.add(posting_key)
         return False                       # empreinte jamais vue → on garde
     if emp and emp not in known:
         known.add(emp)
         if seen_urls is not None and url_key:
             seen_urls.add(url_key)
+        if seen_postings is not None and posting_key:
+            seen_postings.add(posting_key)
         return False                       # employeur connu et distinct → on garde
     return True                            # même titre, pas de nouvel employeur → doublon
 
@@ -1613,14 +2321,17 @@ def deduplicate_jobs(jobs: list) -> list:
         jobs,
         key=lambda item: (0 if job_employer(item) else 1, item.get("found_at", "")),
     )
-    fingerprints, urls = {}, set()
-    return [item for item in ordered if not is_duplicate(item, fingerprints, urls)]
+    fingerprints, urls, postings = {}, set(), set()
+    return [
+        item for item in ordered
+        if not is_duplicate(item, fingerprints, urls, postings)
+    ]
 
 
 # Zone géographique acceptée : Genève + district de Nyon proche
 GEO_OK = GENEVE_ZONE | VAUD_ZONE
 
-# Lieux explicitement trop loin → rejet immédiat (même si autres indices)
+# Lieux suisses explicitement trop loin → rejet immédiat (même si autres indices)
 GEO_FAR = [
     "lausanne", "morges", "gland", "rolle", "yverdon", "vevey", "montreux",
     "fribourg", "neuchatel", "neuchâtel", "sion", "valais", "berne", "bern",
@@ -1628,12 +2339,165 @@ GEO_FAR = [
     "biel", "bienne", "delemont", "delémont", "jura", "aigle", "bulle",
     "pully", "renens", "vverdon", "winterthur", "saint-gall", "tessin",
     "lugano", "thoune", "coire", "chur", "schaffhouse", "zoug", "zug",
+    "spreitenbach", "baden", "aarau", "argovie", "aargau", "soleure",
+    "solothurn", "schwyz", "st-gall", "st. gall", "st. gallen",
 ]
+
+# Pays et villes étrangères fréquents dans les portails internationaux. Ce
+# registre n'essaie pas de géocoder le monde entier : il transforme seulement
+# un lieu explicite en preuve hors zone. Un lieu réellement indéterminé reste
+# éligible à « À vérifier ».
+GEO_FOREIGN_COUNTRIES = [
+    "france", "allemagne", "germany", "italie", "italy", "autriche", "austria",
+    "espagne", "spain", "portugal", "belgique", "belgium", "pays-bas",
+    "netherlands", "royaume-uni", "united kingdom", "angleterre", "england",
+    "irlande", "ireland", "états-unis", "etats-unis", "united states", "usa",
+    "canada", "maroc", "morocco", "algérie", "algerie", "algeria", "tunisie",
+    "tunisia", "sénégal", "senegal", "chine", "china", "japon", "japan",
+    "singapour", "singapore", "inde", "india", "australie", "australia",
+    "brésil", "bresil", "brazil", "mexique", "mexico",
+]
+GEO_FOREIGN_CITIES = [
+    "annemasse", "lyon", "paris", "lille", "grenoble", "chambéry", "chambery",
+    "annecy", "ferney-voltaire", "saint-julien-en-genevois", "munich", "berlin",
+    "francfort", "frankfurt", "milan", "rome", "bruxelles", "brussels",
+    "londres", "london", "dublin", "madrid", "barcelone", "barcelona",
+    "lisbonne", "lisbon", "new york", "washington", "montréal", "montreal",
+    "toronto", "rabat", "casablanca", "tunis", "dakar", "shanghai", "pékin",
+    "pekin", "beijing", "tokyo", "osaka", "delhi", "mumbai", "sydney",
+]
+GEO_SWISS_CANTONS = {
+    "aargau": "Argovie", "argovie": "Argovie",
+    "bern": "Berne", "berne": "Berne",
+    "zurich": "Zurich", "zürich": "Zurich",
+    "basel": "Bâle", "bale": "Bâle", "bâle": "Bâle",
+    "fribourg": "Fribourg", "valais": "Valais",
+    "neuchatel": "Neuchâtel", "neuchâtel": "Neuchâtel",
+    "jura": "Jura", "lucerne": "Lucerne", "luzern": "Lucerne",
+    "solothurn": "Soleure", "soleure": "Soleure",
+    "schwyz": "Schwyz", "tessin": "Tessin",
+}
+GEO_FAR_CITY_CANTONS = {
+    "lausanne": "Vaud", "morges": "Vaud", "gland": "Vaud", "rolle": "Vaud",
+    "yverdon": "Vaud", "vevey": "Vaud", "montreux": "Vaud", "aigle": "Vaud",
+    "pully": "Vaud", "renens": "Vaud", "spreitenbach": "Argovie",
+    "baden": "Argovie", "aarau": "Argovie", "lugano": "Tessin",
+}
 
 # Matching « mot entier » des lieux : « sion » (Valais) ne doit pas matcher
 # « expreSSION », ni « bern » matcher « BERNex » (commune genevoise).
 _GEO_FAR_RE = _compile_terms(GEO_FAR, inflect=False)
 _GEO_OK_RE = _compile_terms(GEO_OK, inflect=False)
+_GEO_FOREIGN_COUNTRY_RE = _compile_terms(GEO_FOREIGN_COUNTRIES, inflect=False)
+_GEO_FOREIGN_CITY_RE = _compile_terms(GEO_FOREIGN_CITIES, inflect=False)
+_GEO_OK_MATCHERS = [
+    (place, _compile_term(place, inflect=False))
+    for place in sorted(GEO_OK, key=len, reverse=True)
+]
+_GEO_FAR_MATCHERS = list(zip(GEO_FAR, _GEO_FAR_RE))
+_GEO_FOREIGN_CITY_MATCHERS = list(zip(GEO_FOREIGN_CITIES, _GEO_FOREIGN_CITY_RE))
+_GEO_FOREIGN_COUNTRY_MATCHERS = list(
+    zip(GEO_FOREIGN_COUNTRIES, _GEO_FOREIGN_COUNTRY_RE)
+)
+_GEO_SWISS_CANTON_MATCHERS = [
+    (alias, canton, _compile_term(alias, inflect=False))
+    for alias, canton in GEO_SWISS_CANTONS.items()
+]
+
+
+def structured_geography(text: str) -> dict:
+    """Classe un texte de localisation en zone cible, hors zone ou inconnu.
+
+    Les champs exposés rendent la décision inspectable dans les tests et les
+    diagnostics. Ils correspondent au niveau de preuve trouvé, sans prétendre
+    déduire une adresse complète.
+    """
+    norm = normalize(text)
+    postal_match = re.search(r"(?<!\d)(1\d{3})(?!\d)", norm)
+    postal_code = int(postal_match.group(1)) if postal_match else None
+    target_postcode = postal_code if postal_code in TARGET_POSTCODES else None
+    target_region = bool(re.search(
+        r"(?:^|[,;/|\s])(?:ch\s*[-/]\s*ge|canton de geneve)"
+        r"(?:$|[,;/|\s])",
+        norm,
+    ))
+    # Les codes pays très courts ne sont interprétés que comme un champ final
+    # délimité : « us » dans une phrase ne doit pas devenir une preuve de pays.
+    iso_match = re.search(
+        r"(?:^|[,;/|]\s*)(us|fr|de|it|at|es|pt|be|nl|gb|uk|ie|ca|ma|dz|tn|"
+        r"sn|cn|jp|sg|in|au|br|mx)\s*$",
+        norm,
+    )
+    foreign_iso = iso_match.group(1) if iso_match else ""
+    local_matches = [
+        (match.start(), -len(place), place)
+        for place, pattern in _GEO_OK_MATCHERS
+        if (match := pattern.search(norm))
+    ]
+    city = min(local_matches)[2] if local_matches else ""
+    far_city = next(
+        (place for place, pattern in _GEO_FAR_MATCHERS if pattern.search(norm)),
+        "",
+    )
+    foreign_city = next(
+        (place for place, pattern in _GEO_FOREIGN_CITY_MATCHERS
+         if pattern.search(norm)),
+        "",
+    )
+    foreign_country = next(
+        (country for country, pattern in _GEO_FOREIGN_COUNTRY_MATCHERS
+         if pattern.search(norm)),
+        "",
+    )
+    swiss_canton = next(
+        (canton for _alias, canton, pattern in _GEO_SWISS_CANTON_MATCHERS
+         if pattern.search(norm)),
+        "",
+    )
+    if far_city or foreign_city or foreign_country or foreign_iso:
+        evidence = far_city or foreign_city or foreign_country or foreign_iso
+        return {
+            "status": "outside", "postal_code": postal_code,
+            "country": (
+                foreign_country or FOREIGN_ISO_CODES.get(foreign_iso, "")
+                or ("Suisse" if far_city else "")
+            ),
+            "canton": swiss_canton or GEO_FAR_CITY_CANTONS.get(far_city, ""),
+            "city": far_city or foreign_city,
+            "evidence": evidence,
+        }
+    if city or target_postcode or target_region:
+        canton = (
+            "Genève"
+            if city in GENEVE_ZONE or target_region
+            or target_postcode in GENEVE_POSTCODES
+            else "Vaud"
+        )
+        return {
+            "status": "target", "country": "Suisse", "canton": canton,
+            "city": city, "postal_code": postal_code,
+            "evidence": city or str(target_postcode or "CH-GE"),
+        }
+    return {
+        "status": "unknown", "country": "", "canton": "",
+        "city": "", "postal_code": postal_code, "evidence": "",
+    }
+
+
+def job_geography(job: dict) -> dict:
+    """Décision géographique priorisant le champ lieu sur le texte de la fiche."""
+    location = str(job.get("location", "") or "")
+    location_geo = structured_geography(location)
+    if location_geo["status"] != "unknown":
+        return location_geo
+    title_geo = structured_geography(job.get("title", ""))
+    if title_geo["status"] != "unknown":
+        return title_geo
+    # Sans champ lieu exploitable, ne lire que le lieu explicitement étiqueté
+    # dans la description. Les simples mentions de pays (clients, missions,
+    # voyages) ne doivent pas transformer une offre locale en offre étrangère.
+    hint = extract_location_hint(job.get("description", "")[:2500])
+    return structured_geography(hint)
 
 
 def in_zone(location: str, description: str = "") -> bool:
@@ -1645,12 +2509,57 @@ def in_zone(location: str, description: str = "") -> bool:
     - Aucun indice de lieu → rejet, car les boards nationaux peuvent ignorer
       leurs paramètres régionaux et renvoyer des offres de Zurich ou Berne.
     """
-    text = normalize(location + " " + description)
-    if term_in(text, _GEO_FAR_RE):
-        return False
-    if term_in(text, _GEO_OK_RE):
+    return job_geography({
+        "location": location,
+        "description": description,
+        "title": "",
+    })["status"] == "target"
+
+
+# Lieux plus larges à remonter seulement dans « À vérifier » pendant un passage
+# de rappel élargi. On garde la sélection principale centrée Genève + Nyon proche.
+GEO_REVIEW = [
+    "lausanne", "gland", "rolle", "morges", "renens", "pully",
+]
+_GEO_REVIEW_RE = _compile_terms(GEO_REVIEW, inflect=False)
+
+
+def broad_recall_enabled() -> bool:
+    """Active un rappel élargi hebdomadaire, sans polluer la sélection principale."""
+    setting = os.environ.get("BROAD_RECALL", "").strip().lower()
+    if setting in ("1", "true", "yes", "oui", "on", "always"):
         return True
-    return False
+    if setting in ("0", "false", "no", "non", "off", "never"):
+        return False
+    days = os.environ.get("BROAD_RECALL_DAYS", "6")
+    enabled_days = {
+        int(part) for part in re.findall(r"\d+", days)
+        if 0 <= int(part) <= 6
+    }
+    return local_now().weekday() in enabled_days
+
+
+def geo_context(job: dict) -> str:
+    """Texte court utilisé pour décider la zone, sans reprendre toute une fiche."""
+    return " ".join((
+        job.get("location", ""),
+        job.get("title", ""),
+        job.get("description", "")[:2500],
+    ))
+
+
+def job_in_zone(job: dict) -> bool:
+    return job_geography(job)["status"] == "target"
+
+
+def job_has_far_location(job: dict) -> bool:
+    if structured_geography(job.get("title", ""))["status"] == "outside":
+        return True
+    return job_geography(job)["status"] == "outside"
+
+
+def job_has_review_location(job: dict) -> bool:
+    return term_in(normalize(geo_context(job)), _GEO_REVIEW_RE)
 
 
 def filter_reason(job: dict) -> str:
@@ -1664,9 +2573,9 @@ def filter_reason(job: dict) -> str:
         return "metier_exclu_dans_titre"
     if is_fle(title, description):
         return "fle_exclu"
-    if term_in(title_norm, _GEO_FAR_RE):
+    if job_has_far_location(job):
         return "lieu_hors_zone_dans_titre"
-    if not in_zone(job.get("location", ""), title):
+    if not job_in_zone(job):
         return "lieu_hors_zone_ou_inconnu"
     if not strict_title_match(title):
         return "aucun_signal_metier_dans_titre"
@@ -1682,14 +2591,164 @@ def review_candidate(job: dict) -> tuple[bool, list]:
         return False, []
     if term_in(title_norm, _TITLE_EXCLUDE_RE) or term_in(title_norm, _EXCLUDE_RE):
         return False, []
-    if is_fle(title, description) or term_in(title_norm, _GEO_FAR_RE):
+    title_far = structured_geography(title)["status"] == "outside"
+    title_review_far = term_in(title_norm, _GEO_REVIEW_RE)
+    if is_fle(title, description):
         return False, []
-    if not in_zone(job.get("location", ""), title):
+    if title_far and not (
+        ACTIVE_PROFILE == "lettres" and broad_recall_enabled() and title_review_far
+    ):
+        return False, []
+    if not job_in_zone(job):
+        if (ACTIVE_PROFILE == "lettres" and broad_recall_enabled()
+                and job_has_review_location(job)):
+            reasons = weak_relevance_reasons(title, description)
+            if strict_title_match(title) or reasons:
+                return True, ["lieu élargi à vérifier"] + reasons
+        if job_has_far_location(job):
+            return False, []
+        reasons = weak_relevance_reasons(title, description)
+        if strict_title_match(title) or reasons:
+            return True, ["lieu à confirmer"] + reasons
         return False, []
     if strict_title_match(title):
         return False, []
     reasons = weak_relevance_reasons(title, description)
     return bool(reasons), list(dict.fromkeys(reasons))
+
+
+def classify_job(job: Job) -> Decision:
+    """Décision unique et inspectable pour la sélection, la revue ou le rejet."""
+    if passes_filters(job):
+        return {"destination": "main", "reason": "", "review_reasons": []}
+    keep, reasons = review_candidate(job)
+    if keep:
+        reasons = list(dict.fromkeys(reasons))
+        return {
+            "destination": "review",
+            "reason": "; ".join(reasons),
+            "review_reasons": reasons,
+        }
+    return {
+        "destination": "reject",
+        "reason": filter_reason(job) or "pertinence_insuffisante",
+        "review_reasons": [],
+    }
+
+
+def _detail_candidate_priority(candidate: dict) -> tuple:
+    """Ordre stable : enrichir d'abord ce qui débloque une vraie décision."""
+    title = candidate["title"]
+    description = candidate["description"]
+    needs_relevance = not strict_title_match(title)
+    needs_geography = not candidate["geo_ok"]
+    blocking_signals = int(needs_relevance) + int(needs_geography)
+    seed_score = relevance_score(title, description)
+    fields = candidate["fields"]
+    return (
+        -blocking_signals,
+        -int(needs_relevance),
+        -int(needs_geography),
+        -seed_score,
+        normalize(fields.get("source", "")),
+        canonical_url(candidate["url"]),
+    )
+
+
+def _finish_considered_candidate(candidate: dict, details: dict | None = None):
+    """Fusionne l'enrichissement puis applique une seule fois le funnel final."""
+    title = candidate["title"]
+    description = candidate["description"]
+    fields = dict(candidate["fields"])
+    details = details or {}
+    if details:
+        description = description or details.get("description", "")
+        if details.get("location") and not candidate["geo_ok"]:
+            fields["location"] = details["location"]
+        if (details.get("company")
+                and not is_meaningful_company(fields.get("company", ""))):
+            fields["company"] = details["company"]
+        for name in (
+            "date_posted", "valid_through", "employment_type",
+            "job_location_type", "external_id", "salary",
+        ):
+            if details.get(name) and not fields.get(name):
+                fields[name] = details[name]
+    job = {
+        "title": title,
+        "url": candidate["url"],
+        "description": description,
+        "found_at": candidate["found_at"],
+        **fields,
+    }
+    if candidate["trusted_geo"] and not job.get("location"):
+        job["location"] = "Genève"
+    finalize(job)
+    if fle_risk(title) and is_fle(title, description):
+        record_rejection("fle_exclu", job)
+        return
+    decision = classify_job(job)
+    if decision["destination"] == "main":
+        candidate["jobs"].append(job)
+        return
+    if decision["destination"] == "review":
+        job["_review"] = True
+        job["review_reason"] = decision["reason"]
+        candidate["jobs"].append(job)
+        return
+    record_rejection(decision["reason"], job)
+
+
+def _pending_detail_count(source: str = "") -> int:
+    with _COUNTERS_LOCK:
+        if not source:
+            return len(_pending_detail_candidates)
+        return sum(
+            1 for item in _pending_detail_candidates
+            if item["fields"].get("source") == source
+        )
+
+
+def _fair_detail_order(pending: list) -> list:
+    """Évite qu'une grosse source monopolise le quota à priorité égale."""
+    buckets = defaultdict(lambda: defaultdict(deque))
+    for candidate in sorted(pending, key=_detail_candidate_priority):
+        priority = _detail_candidate_priority(candidate)
+        bucket_key = priority[:4]
+        source = normalize(candidate["fields"].get("source", "")) or "?"
+        buckets[bucket_key][source].append(candidate)
+    ordered = []
+    for bucket_key in sorted(buckets):
+        queues = buckets[bucket_key]
+        while any(queues.values()):
+            for source in sorted(queues):
+                if queues[source]:
+                    ordered.append(queues[source].popleft())
+    return ordered
+
+
+def _process_pending_detail_candidates():
+    """Enrichit les candidats après la collecte, dans un ordre reproductible."""
+    with _COUNTERS_LOCK:
+        pending = list(_pending_detail_candidates)
+        _pending_detail_candidates.clear()
+    before = _detail_fetch_count
+    for candidate in _fair_detail_order(pending):
+        try:
+            details = fetch_detail_fields(candidate["url"], candidate["title"])
+            _finish_considered_candidate(candidate, details)
+        except Exception as exc:
+            log(
+                f"⚠️  Enrichissement impossible "
+                f"({candidate['fields'].get('source', '?')}): {exc}"
+            )
+            _finish_considered_candidate(candidate, {})
+    if pending:
+        log(
+            f"Enrichissement différé : {len(pending)} candidat(s) classé(s), "
+            f"{_detail_fetch_count - before} fiche(s) téléchargée(s), "
+            f"quota {MAX_DETAIL_FETCHES}."
+        )
 
 
 def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set):
@@ -1703,14 +2762,22 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
     fields = dict(base_fields)
     query = fields.pop("_query", "")
     no_fetch = fields.pop("_no_fetch", False)
+    trusted_geo = fields.pop("_trusted_geo", False)
+    health_source = fields.pop("_health_source", "")
     src = fields.get("source", "?")
     # Candidat brut avant filtres. Verrouillé car les scrapers HTTP tournent en parallèle.
-    with _COUNTERS_LOCK:
-        _raw_counts[src] = _raw_counts.get(src, 0) + 1
+    record_raw_candidate(src)
+    if health_source and health_source != src:
+        record_raw_candidate(health_source)
     record_query_candidate(src, query)
     if url in seen_urls:
         return
-    seed_job = {"title": title, "url": url, "description": fields.pop("description", ""), **fields}
+    seed_job = {
+        "title": title,
+        "url": url,
+        "description": fields.pop("description", ""),
+        **fields,
+    }
     if not is_french_text(title):
         record_rejection("langue_non_prise_en_charge", seed_job)
         return
@@ -1718,8 +2785,12 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
     if term_in(title_norm, _TITLE_EXCLUDE_RE) or term_in(title_norm, _EXCLUDE_RE):
         record_rejection("metier_exclu_dans_titre", seed_job)
         return
-    if not in_zone(fields.get("location", ""), title):
-        record_rejection("lieu_hors_zone_ou_inconnu", seed_job)
+    title_far = structured_geography(title)["status"] == "outside"
+    title_review_far = term_in(title_norm, _GEO_REVIEW_RE)
+    if title_far and not (
+        ACTIVE_PROFILE == "lettres" and broad_recall_enabled() and title_review_far
+    ):
+        record_rejection("lieu_hors_zone_dans_titre", seed_job)
         return
     seen_urls.add(url)
     description = seed_job.get("description", "")
@@ -1731,28 +2802,26 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
     if not plausible:
         record_rejection("pertinence_insuffisante", seed_job)
         return
-    if not description and FETCH_LOCAL_DETAILS and not no_fetch:
-        description = fetch_description(url, title)
-    job = {
-        "title": title, "url": url,
+    geo_ok = trusted_geo or in_zone(fields.get("location", ""), title + " " + description)
+    needs_details = FETCH_LOCAL_DETAILS and FETCH_DESCRIPTIONS and not no_fetch and (
+        not description or not geo_ok or not is_meaningful_company(fields.get("company", ""))
+    )
+    candidate = {
+        "title": title,
+        "url": url,
         "description": description,
-        "found_at": datetime.now().isoformat(),
-        **fields,
+        "fields": fields,
+        "trusted_geo": trusted_geo,
+        "geo_ok": geo_ok,
+        "found_at": local_now().isoformat(),
+        "jobs": jobs,
     }
-    finalize(job)
-    if fle_risk(title) and is_fle(title, description):
-        record_rejection("fle_exclu", job)
+    if needs_details and _DEFER_DETAIL_FETCHES:
+        with _COUNTERS_LOCK:
+            _pending_detail_candidates.append(candidate)
         return
-    if passes_filters(job):
-        jobs.append(job)
-        return
-    keep_for_review, reasons = review_candidate(job)
-    if keep_for_review:
-        job["_review"] = True
-        job["review_reason"] = "; ".join(reasons)
-        jobs.append(job)
-        return
-    record_rejection(filter_reason(job), job)
+    details = fetch_detail_fields(url, title) if needs_details else {}
+    _finish_considered_candidate(candidate, details)
 
 
 # ---------------------------------------------------------------------------
@@ -1819,7 +2888,9 @@ def scrape_letemps() -> list:
 
 def scrape_vaud() -> list:
     """Offres de l'État de Vaud via Oracle HCM REST API."""
+    SOURCE = "offres-emploi.vd.ch"
     jobs = []
+    mark_raw_source(SOURCE)
     oracle_base = "https://fa-ewrg-saasfaeuraprod1.fa.ocs.oraclecloud.com"
     api_url = (
         f"{oracle_base}/hcmRestApi/resources/11.13.18.05/"
@@ -1840,6 +2911,7 @@ def scrape_vaud() -> list:
             jid = job.get("Id")
             if not title or not jid:
                 continue
+            record_raw_candidate(SOURCE)
             short_desc = job.get("ShortDescriptionStr") or ""
             loc = job.get("PrimaryLocation", "")
             if not any(z in loc.lower() for z in VAUD_ZONE):
@@ -1851,9 +2923,10 @@ def scrape_vaud() -> list:
                 j = {
                     "title": title, "company": "État de Vaud",
                     "url": f"https://offres-emploi.vd.ch/#fr/job/{jid}",
-                    "source": "offres-emploi.vd.ch", "location": loc,
+                    "source": SOURCE, "location": loc,
+                    "external_id": str(jid),
                     "description": short_desc,
-                    "found_at": datetime.now().isoformat(),
+                    "found_at": local_now().isoformat(),
                 }
                 jobs.append(finalize(j))
                 found += 1
@@ -1861,6 +2934,42 @@ def scrape_vaud() -> list:
     except Exception as e:
         log(f"Erreur scrape_vaud: {e}")
     return jobs
+
+
+def _parse_jobscout24_page(html: str, base: str, fallback_location: str = "",
+                           zone_filter: set | None = None) -> list:
+    """Parse une page JobScout24 sans réseau, pour tests et scraper réel."""
+    soup = BeautifulSoup(html, "lxml")
+    offers, seen = [], set()
+    links = soup.select("a.job-link-detail, a.job-title, a[href*='/fr/job/']")
+    for link in links:
+        href = link.get("href", "")
+        if "/fr/job/" not in href:
+            continue
+        title = (link.get("title", "") or link.get_text(strip=True)).strip()
+        if not title:
+            continue
+        full_url = urljoin(base + "/", href)
+        url_key = canonical_url(full_url)
+        if url_key in seen:
+            continue
+        container = link.find_parent(["li", "article"]) or _job_card(link)
+        location = container.get_text(" ", strip=True)[:300] if container else ""
+        if container:
+            spans = container.select("p.job-attributes span, .job-location, .location")
+            if spans:
+                texts = [span.get_text(strip=True) for span in spans]
+                location = texts[1] if len(texts) > 1 else texts[0]
+        if (fallback_location and not in_zone(location, title)
+                and not term_in(normalize(location), _GEO_FAR_RE)):
+            location = fallback_location
+        if zone_filter is not None and not any(
+            normalize(place) in normalize(location) for place in zone_filter
+        ):
+            continue
+        seen.add(url_key)
+        offers.append({"title": title, "url": full_url, "location": location})
+    return offers
 
 
 def scrape_jobscout24() -> list:
@@ -1883,11 +2992,11 @@ def scrape_jobscout24() -> list:
     ]
     BASE = "https://www.jobscout24.ch"
     jobs, seen_urls = [], set()
-    search_configs = [("GE", GENEVE_ZONE), ("VD", VAUD_ZONE)]
+    search_configs = [("GE", GENEVE_ZONE, "Genève"), ("VD", VAUD_ZONE, "")]
 
     for kw in source_terms("jobscout24", KEYWORDS_JS24):
         mark_query("jobscout24.ch", kw)
-        for region_code, zone_filter in search_configs:
+        for region_code, zone_filter, fallback_location in search_configs:
             url = f"{BASE}/fr/jobs/{kw}/?region={region_code}"
             if not robots_allows(url):
                 continue
@@ -1895,39 +3004,57 @@ def scrape_jobscout24() -> list:
                 _polite_wait(url)
                 r = session().get(url, timeout=15)
                 if r.status_code != 200:
+                    log(
+                        f"Erreur jobscout24 [{kw}/{region_code}] : "
+                        f"HTTP {r.status_code}"
+                    )
                     continue
-                soup = BeautifulSoup(r.text, "lxml")
-                # --- SÉLECTEUR ROBUSTE : liens d'offres par motif d'URL ---
-                links = soup.select("a.job-link-detail, a.job-title, a[href*='/fr/job/']")
-                for link in links:
-                    href = link.get("href", "")
-                    if "/fr/job/" not in href:
-                        continue
-                    title = (link.get("title", "") or link.get_text(strip=True)).strip()
-                    if not title:
-                        continue
-                    full_url = BASE + href if href.startswith("/") else href
-                    if full_url in seen_urls:
-                        continue
-                    # Lieu/entreprise : on cherche dans le conteneur parent proche
-                    container = link.find_parent(["li", "article"]) or _job_card(link)
-                    location = container.get_text(" ", strip=True)[:300] if container else ""
-                    if container:
-                        spans = container.select("p.job-attributes span, .job-location, .location")
-                        if spans:
-                            texts = [s.get_text(strip=True) for s in spans]
-                            # heuristique : le lieu est souvent le 2e attribut
-                            location = texts[1] if len(texts) > 1 else texts[0]
+                for offer in _parse_jobscout24_page(
+                    r.text, BASE, fallback_location, zone_filter
+                ):
                     # Le filtre géographique fin est de toute façon dans consider()
-                    consider(title, full_url,
+                    consider(offer["title"], offer["url"],
                              {"company": "—", "source": "jobscout24.ch",
-                              "location": location, "_query": kw}, jobs, seen_urls)
+                              "location": offer["location"], "_query": kw,
+                              "_trusted_geo": bool(fallback_location)}, jobs, seen_urls)
             except Exception as e:
                 log(f"Erreur jobscout24 [{kw}/{region_code}]: {e}")
 
     _warn_if_empty("jobscout24.ch", jobs)
     log(f"jobscout24.ch: {len(jobs)} offre(s) trouvée(s)")
     return jobs
+
+
+def _parse_jobup_page(html: str, base: str, fallback_location: str = "",
+                      zone_filter: set | None = None) -> list:
+    """Parse les cartes Jobup à partir d'un instantané HTML."""
+    soup = BeautifulSoup(html, "lxml")
+    offers, seen = [], set()
+    for card in soup.select("[data-cy='serp-item']"):
+        link = card.select_one("[data-cy='job-link']")
+        if not link:
+            continue
+        title = link.get("title", "").strip()
+        href = link.get("href", "")
+        if not title or not href:
+            continue
+        full_url = urljoin(base + "/", href)
+        url_key = canonical_url(full_url)
+        if url_key in seen:
+            continue
+        card_text = card.get_text("\n")
+        location = ""
+        if "Lieu de travail" in card_text:
+            after = card_text.split("Lieu de travail", 1)[1]
+            location = after.strip().lstrip(":").split("\n")[0].strip()[:60]
+        location = location or fallback_location
+        if zone_filter is not None and not any(
+            normalize(place) in normalize(location) for place in zone_filter
+        ):
+            continue
+        seen.add(url_key)
+        offers.append({"title": title, "url": full_url, "location": location})
+    return offers
 
 
 def scrape_jobup() -> list:
@@ -1946,12 +3073,12 @@ def scrape_jobup() -> list:
         "chargé de projet culturel", "musée", "patrimoine",
         "médiation culturelle",
     ]
-    SEARCH_CONFIGS = [("region=34", None), ("location=nyon", VAUD_ZONE)]
+    SEARCH_CONFIGS = [("region=34", None, "Genève"), ("location=nyon", VAUD_ZONE, "Nyon")]
     jobs, seen_urls = [], set()
 
     for kw in source_terms("jobup", KEYWORDS_JU):
         mark_query("jobup.ch", kw)
-        for geo_param, zone_filter in SEARCH_CONFIGS:
+        for geo_param, zone_filter, fallback_location in SEARCH_CONFIGS:
             url = f"{BASE}/fr/emplois/?{geo_param}&term={quote(kw)}"
             if not robots_allows(url):
                 continue
@@ -1959,37 +3086,55 @@ def scrape_jobup() -> list:
                 _polite_wait(url)
                 r = session().get(url, timeout=15)
                 if r.status_code != 200:
+                    log(
+                        f"Erreur jobup [{kw}/{geo_param}] : HTTP {r.status_code}"
+                    )
                     continue
-                soup = BeautifulSoup(r.text, "lxml")
-                for card in soup.select("[data-cy='serp-item']"):
-                    link = card.select_one("[data-cy='job-link']")
-                    if not link:
-                        continue
-                    title = link.get("title", "").strip()
-                    href = link.get("href", "")
-                    if not title or not href:
-                        continue
-                    full_url = BASE + href if href.startswith("/") else href
-                    if full_url in seen_urls:
-                        continue
-                    card_text = card.get_text("\n")
-                    loc = ""
-                    if "Lieu de travail" in card_text:
-                        after = card_text.split("Lieu de travail", 1)[1]
-                        loc_raw = after.strip().lstrip(":").split("\n")[0].strip()
-                        if loc_raw:
-                            loc = loc_raw[:60]
-                    if zone_filter is not None and not any(z in loc.lower() for z in zone_filter):
-                        continue
-                    consider(title, full_url,
+                for offer in _parse_jobup_page(
+                    r.text, BASE, fallback_location, zone_filter
+                ):
+                    consider(offer["title"], offer["url"],
                              {"company": "—", "source": "jobup.ch",
-                              "location": loc, "_query": kw}, jobs, seen_urls)
+                              "location": offer["location"], "_query": kw,
+                              "_trusted_geo": True}, jobs, seen_urls)
             except Exception as e:
                 log(f"Erreur jobup [{kw}/{geo_param}]: {e}")
 
     _warn_if_empty("jobup.ch", jobs)
     log(f"jobup.ch: {len(jobs)} offre(s) trouvée(s)")
     return jobs
+
+
+_TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _transient_retry_delay(response, attempt: int) -> float:
+    """Délai borné, en respectant Retry-After lorsqu'il est fourni."""
+    value = str(response.headers.get("Retry-After", "")).strip()
+    try:
+        return min(30.0, max(0.0, float(value)))
+    except ValueError:
+        return float(2 ** attempt)
+
+
+def _adzuna_get(url: str, retries: int = 2):
+    """GET Adzuna avec reprise courte sur surcharge, sans journaliser les clés."""
+    last_response = None
+    for attempt in range(max(1, retries)):
+        _polite_wait(url)
+        try:
+            response = session().get(url, timeout=15)
+        except requests.RequestException:
+            if attempt + 1 >= retries:
+                raise
+            time.sleep(float(2 ** attempt))
+            continue
+        last_response = response
+        if response.status_code not in _TRANSIENT_HTTP_STATUSES:
+            return response
+        if attempt + 1 < retries:
+            time.sleep(_transient_retry_delay(response, attempt))
+    return last_response
 
 
 def scrape_adzuna() -> list:
@@ -2007,6 +3152,7 @@ def scrape_adzuna() -> list:
         "médiathécaire", "chargé de médiation", "rédacteur technique",
     ]
     jobs, seen_urls = [], set()
+    consecutive_unavailable = 0
     for kw in source_terms("adzuna", KEYWORDS_AZ):
         mark_query("Adzuna (Indeed+)", kw)
         url = (
@@ -2017,11 +3163,19 @@ def scrape_adzuna() -> list:
             "&content-type=application/json"
         )
         try:
-            _polite_wait(url)
-            r = session().get(url, timeout=15)
+            r = _adzuna_get(url)
             if r.status_code != 200:
-                log(f"Adzuna [{kw}]: HTTP {r.status_code}")
+                log(f"Erreur Adzuna [{kw}] : HTTP {r.status_code}")
+                if r.status_code in _TRANSIENT_HTTP_STATUSES:
+                    consecutive_unavailable += 1
+                    if consecutive_unavailable >= 2:
+                        log(
+                            "Adzuna temporairement indisponible : arrêt des "
+                            "requêtes restantes pour ce passage"
+                        )
+                        break
                 continue
+            consecutive_unavailable = 0
             for item in r.json().get("results", []):
                 title = item.get("title", "").strip()
                 link = item.get("redirect_url", "")
@@ -2035,11 +3189,23 @@ def scrape_adzuna() -> list:
                 consider(
                     title, link,
                     {"company": company, "source": "Adzuna (Indeed+)",
-                     "location": location, "description": desc, "_query": kw},
+                     "location": location, "description": desc, "_query": kw,
+                     # L'API fournit déjà les champs utiles et ses redirections
+                     # publicitaires sont interdites par robots.txt.
+                     "_no_fetch": True},
                     jobs, set(),
                 )
-        except Exception as e:
-            log(f"Adzuna [{kw}]: {e}")
+        except requests.RequestException as exc:
+            consecutive_unavailable += 1
+            log(f"Adzuna [{kw}] : erreur réseau ({type(exc).__name__})")
+            if consecutive_unavailable >= 2:
+                log(
+                    "Adzuna temporairement indisponible : arrêt des "
+                    "requêtes restantes pour ce passage"
+                )
+                break
+        except (ValueError, TypeError) as exc:
+            log(f"Adzuna [{kw}] : réponse JSON invalide ({type(exc).__name__})")
     log(f"Adzuna: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
@@ -2067,24 +3233,88 @@ def _new_stealth_context(browser):
 
 
 def _launch_chromium(playwright):
-    """Lance Chromium localement ou le binaire géré par Playwright."""
-    kwargs = {
-        "headless": True,
-        "args": ["--no-sandbox", "--disable-setuid-sandbox"],
-    }
-    if _CHROMIUM_PATH:
-        kwargs["executable_path"] = _CHROMIUM_PATH
-    return playwright.chromium.launch(**kwargs)
+    """Lance le Chromium Playwright, puis un éventuel navigateur système natif."""
+    explicit_path = os.environ.get("CHROMIUM_EXECUTABLE_PATH", "").strip()
+    if explicit_path:
+        if _is_snap_chromium(explicit_path):
+            raise PlaywrightBrowserUnavailable(
+                "CHROMIUM_EXECUTABLE_PATH désigne Chromium Snap, non pris en charge"
+            )
+        if not _is_executable_file(explicit_path):
+            raise PlaywrightBrowserUnavailable(
+                f"CHROMIUM_EXECUTABLE_PATH invalide : {explicit_path}"
+            )
+        return playwright.chromium.launch(
+            headless=True, executable_path=explicit_path
+        )
+
+    # Le navigateur géré par Playwright est prioritaire : sa version correspond
+    # exactement à celle de la bibliothèque Python et fonctionne aussi en CI.
+    managed_path = str(playwright.chromium.executable_path or "")
+    if _is_executable_file(managed_path):
+        return playwright.chromium.launch(
+            headless=True, executable_path=managed_path
+        )
+
+    system_path = _CHROMIUM_PATH or _find_system_chromium()
+    if system_path:
+        return playwright.chromium.launch(
+            headless=True, executable_path=system_path
+        )
+
+    raise PlaywrightBrowserUnavailable(
+        "Chromium Playwright absent. Mise à niveau/installation : "
+        "./venv/bin/python3 -m pip install -U 'playwright>=1.61,<2', puis "
+        "./venv/bin/python3 -m playwright install --with-deps chromium"
+    )
 
 
-def fetch_via_playwright(url: str, wait_selector: str = None):
+_PLAYWRIGHT_FAILURE_LOG_LOCK = threading.Lock()
+_PLAYWRIGHT_FAILURES_REPORTED = set()
+
+
+def _playwright_error_summary(exc: Exception) -> str:
+    """Conserve la cause utile sans recopier les centaines de lignes du navigateur."""
+    first_line = next(
+        (line.strip() for line in str(exc).splitlines() if line.strip()),
+        type(exc).__name__,
+    )
+    return first_line[:500]
+
+
+def _log_playwright_failure(url: str, exc: Exception):
+    """Journalise une seule fois la même panne Playwright par site et profil."""
+    summary = _playwright_error_summary(exc)
+    host = urlparse(url).netloc or url
+    key = (ACTIVE_PROFILE, host, type(exc).__name__, summary)
+    with _PLAYWRIGHT_FAILURE_LOG_LOCK:
+        if key in _PLAYWRIGHT_FAILURES_REPORTED:
+            return
+        _PLAYWRIGHT_FAILURES_REPORTED.add(key)
+    suffix = (
+        " — source ignorée"
+        if isinstance(exc, PlaywrightBrowserUnavailable)
+        else ""
+    )
+    log(f"Erreur Playwright {host} : {summary}{suffix}")
+
+
+def fetch_via_playwright(url: str, wait_selector: str = None,
+                         wait_until: str = "domcontentloaded"):
     """Charge une page derrière un mur JS via un Chromium furtif.
 
     Laisse le vrai navigateur exécuter le défi anti-bot (ex. POST /bot_score de
     myScience) puis renvoie le HTML rendu sous forme de BeautifulSoup.
     Retourne None si Chromium est indisponible ou en cas d'échec.
     """
+    cached_html = _run_cached_html(url)
+    if cached_html is not None:
+        return BeautifulSoup(cached_html, "lxml")
     if not PLAYWRIGHT_AVAILABLE:
+        _log_playwright_failure(
+            url,
+            PlaywrightBrowserUnavailable("bibliothèque Playwright non installée"),
+        )
         return None
     try:
         with _sync_playwright() as pw:
@@ -2092,7 +3322,9 @@ def fetch_via_playwright(url: str, wait_selector: str = None):
             ctx = _new_stealth_context(browser)
             page = ctx.new_page()
             try:
-                page.goto(url, wait_until="networkidle", timeout=25000)
+                # `networkidle` ne se produit jamais sur certains sites qui
+                # gardent analytics/WebSocket ouverts (notamment CAGI).
+                page.goto(url, wait_until=wait_until, timeout=25000)
                 if wait_selector:
                     try:
                         page.wait_for_selector(wait_selector, timeout=8000)
@@ -2103,9 +3335,10 @@ def fetch_via_playwright(url: str, wait_selector: str = None):
                 html = page.content()
             finally:
                 browser.close()
+        _remember_run_html(url, html)
         return BeautifulSoup(html, "lxml")
     except Exception as e:
-        log(f"Erreur fetch_via_playwright {url}: {e}")
+        _log_playwright_failure(url, e)
         return None
 
 
@@ -2118,11 +3351,11 @@ INDEED_QUERIES = [
 
 
 def scrape_indeed_pw() -> list:
-    """Offres Indeed CH via Playwright. Nécessite un Chromium système (apt)."""
+    """Offres Indeed CH via Playwright. Nécessite Chromium Playwright."""
     if not ENABLE_INDEED:
         return []                # désactivé par défaut (anti-bot) — cf. ENABLE_INDEED
     if not PLAYWRIGHT_AVAILABLE:
-        log("Indeed : Chromium système introuvable — source ignorée (sudo apt install chromium-browser)")
+        log("Indeed : Playwright non installé — source ignorée")
         return []
     jobs, seen_urls = [], set()
     with _sync_playwright() as pw:
@@ -2162,11 +3395,11 @@ def scrape_indeed_pw() -> list:
                         "title": title, "company": "—", "url": full_url,
                         "source": "Indeed CH", "location": location,
                         "description": "",
-                        "found_at": datetime.now().isoformat(),
+                        "found_at": local_now().isoformat(),
                     }
                     jobs.append(finalize(j))
             except Exception as e:
-                log(f"Indeed PW [{term}]: {e}")
+                _log_playwright_failure(url, e)
             time.sleep(2)
         browser.close()
     log(f"Indeed CH (Playwright): {len(jobs)} offre(s) trouvée(s)")
@@ -2200,12 +3433,48 @@ def _parse_jobs_ch_anchor(raw: str):
     return title, location
 
 
+def _parse_jobs_ch_page(html: str, base: str = "https://www.jobs.ch") -> list:
+    """Parse les cartes jobs.ch rendues par Playwright, sans navigateur."""
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.select('[data-cy="serp-item"]')
+    if not cards:
+        cards = soup.select('a[href*="/offres-emplois/detail/"]')
+    offers, seen = [], set()
+    for card in cards:
+        anchor = (
+            card.select_one('a[data-cy="job-link"]')
+            or (card if card.name == "a"
+                else card.select_one('a[href*="/offres-emplois/detail/"]'))
+        )
+        if not anchor or not anchor.get("href"):
+            continue
+        href = anchor["href"]
+        if "/offres-emplois/detail/" not in href:
+            continue
+        full_url = urljoin(base + "/", href)
+        url_key = canonical_url(full_url)
+        if url_key in seen:
+            continue
+        title, location = _parse_jobs_ch_anchor(
+            anchor.get_text(" ", strip=True)
+        )
+        if not title or len(title) < 4:
+            continue
+        seen.add(url_key)
+        offers.append({
+            "title": title,
+            "url": full_url,
+            "location": location or "Genève",
+        })
+    return offers
+
+
 def scrape_jobs_ch_pw() -> list:
     """Offres jobs.ch via Playwright (rendu JS). Best-effort.
 
     Plus gros board suisse, mais protégé (Cloudflare) et recouvrant largement
     jobscout24 (même groupe JobCloud — la fusion des doublons par titre+employeur
-    regroupe les annonces communes). Nécessite un Chromium système.
+    regroupe les annonces communes). Nécessite Chromium Playwright.
 
     NB : jobs.ch fait de la recherche *sémantique* — une requête niche (ex.
     « bibliothécaire ») ramène aussi des offres voisines hors-sujet, écartées
@@ -2213,7 +3482,7 @@ def scrape_jobs_ch_pw() -> list:
     ce jour-là, PAS un sélecteur cassé (vérifié : les cartes se parsent bien).
     """
     if not PLAYWRIGHT_AVAILABLE:
-        log("jobs.ch : Chromium système introuvable — source ignorée")
+        log("jobs.ch : Playwright non installé — source ignorée")
         return []
     jobs, seen_urls = [], set()
     with _sync_playwright() as pw:
@@ -2231,41 +3500,16 @@ def scrape_jobs_ch_pw() -> list:
                                            timeout=8000)
                 except Exception:
                     pass
-                soup = BeautifulSoup(page.content(), "lxml")
-                # jobs.ch = SPA React : chaque résultat est une carte
-                # data-cy="serp-item" contenant un lien data-cy="job-link".
-                # Ces hooks de test sont stables ; repli sur les anciennes
-                # ancres /offres-emplois/detail/ si jobs.ch les retire.
-                # SÉLECTEUR À AJUSTER SI BESOIN.
-                cards = soup.select('[data-cy="serp-item"]')
-                if not cards:
-                    cards = soup.select('a[href*="/offres-emplois/detail/"]')
-                for card in cards:
-                    a = (card.select_one('a[data-cy="job-link"]')
-                         or (card if card.name == "a"
-                             else card.select_one('a[href*="/offres-emplois/detail/"]')))
-                    if not a or not a.get("href"):
-                        continue
-                    href = a["href"]
-                    if "/offres-emplois/detail/" not in href:
-                        continue
-                    full_url = ("https://www.jobs.ch" + href
-                                if href.startswith("/") else href)
-                    if full_url in seen_urls:
-                        continue
-                    title, location = _parse_jobs_ch_anchor(
-                        a.get_text(" ", strip=True))
-                    if not title or len(title) < 4:
-                        continue
-                    seen_urls.add(full_url)
+                for offer in _parse_jobs_ch_page(page.content()):
                     consider(
-                        title, full_url,
-                        {"company": "", "source": "jobs.ch", "location": location,
-                         "_query": term},
-                        jobs, set(),
+                        offer["title"], offer["url"],
+                        {"company": "", "source": "jobs.ch",
+                         "location": offer["location"],
+                         "_query": term, "_trusted_geo": True},
+                        jobs, seen_urls,
                     )
             except Exception as e:
-                log(f"jobs.ch PW [{term}]: {e}")
+                _log_playwright_failure(url, e)
             time.sleep(2)
         browser.close()
     log(f"jobs.ch (Playwright): {len(jobs)} offre(s) trouvée(s)")
@@ -2507,7 +3751,11 @@ def scrape_educa() -> list:
     return jobs
 
 
-_EDUCH_OFFER_RE = re.compile(r"/emploi/.+-e\d+\.html")
+# Educh a supprimé l'extension « .html » de ses nouvelles fiches en 2026, tout
+# en la conservant sur les anciennes. Le chemin doit donc accepter les 2 formes.
+_EDUCH_OFFER_RE = re.compile(
+    r"/emploi/[^/?#]+-e\d+(?:\.html)?/?$", re.I
+)
 # Le texte du lien educh accole au titre des métadonnées emoji :
 # « Titre 📍 Lieu 🕒 Taux 📄 Contrat Employeur ». SÉLECTEUR À AJUSTER SI BESOIN.
 _EDUCH_EMOJI = "📍🕒📄💼🗓️"
@@ -2519,6 +3767,7 @@ _EDUCH_CONTRACT_WORD_RE = re.compile(
     r"\b(CDI|CDD|Permanent|Temporaire|Stage|Auxiliaire|Mission|Apprentissage|"
     r"Fixe|Int[ée]rim|Temps\s+partiel|Temps\s+plein)\b", re.I)
 _EDUCH_VIEWS_RE = re.compile(r"\b\d+\s+vues?\b", re.I)
+_EDUCH_APPLICATIONS_RE = re.compile(r"\b\d+\s+candidatures?\b", re.I)
 
 # Les listes educh préfixent chaque libellé d'une date relative ou absolue
 # (« il y a 2 heures », « 11 juin »…) ; on la retire avant d'isoler le titre.
@@ -2534,6 +3783,7 @@ _EDUCH_DATE_PREFIX_RE = re.compile(
 def _clean_educh_text(text: str) -> str:
     text = _EDUCH_DATE_PREFIX_RE.sub("", str(text or "").strip())
     text = _EDUCH_VIEWS_RE.sub(" ", text)
+    text = _EDUCH_APPLICATIONS_RE.sub(" ", text)
     return re.sub(r"\s+", " ", text).strip(" -–·|")
 
 
@@ -2565,7 +3815,10 @@ def _parse_educh_plain_anchor(text: str):
     if loc_m:
         location = loc_m.group(0)
     taux = extract_taux(text)
-    company = _trim_location_suffix(extract_employer(text), location)
+    company = extract_employer(text)
+    company = _EDUCH_CONTRACT_WORD_RE.sub(" ", company)
+    company = re.sub(r"\s+", " ", company).strip(" -–·,|")
+    company = _trim_location_suffix(company, location)
 
     title = text
     for part in (company, location, taux):
@@ -2598,6 +3851,32 @@ def _parse_educh_anchor(text: str):
     return title, location, taux, company
 
 
+def _parse_educh_page(html: str, base: str = "https://www.educh.ch") -> list:
+    """Parse les liens d'offres educh depuis une fixture ou une page réelle."""
+    soup = BeautifulSoup(html, "lxml")
+    offers, seen = [], set()
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if not _EDUCH_OFFER_RE.fullmatch(urlparse(href).path):
+            continue
+        full_url = urljoin(base + "/", href)
+        url_key = canonical_url(full_url)
+        if url_key in seen:
+            continue
+        title, location, taux, company = _parse_educh_anchor(
+            anchor.get_text(" ", strip=True)
+        )
+        seen.add(url_key)
+        offers.append({
+            "title": title,
+            "url": full_url,
+            "location": location or "Genève",
+            "taux": taux,
+            "company": company or "—",
+        })
+    return offers
+
+
 def scrape_educh() -> list:
     """Offres educh.ch (petite enfance, social, enseignement spécialisé) — Genève.
 
@@ -2618,20 +3897,18 @@ def scrape_educh() -> list:
         soup = fetch(url)
         if not soup:
             continue
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if not _EDUCH_OFFER_RE.search(href):
-                continue
+        for offer in _parse_educh_page(str(soup), "https://www.educh.ch"):
             raw_links += 1
-            if not href.startswith("http"):
-                href = urljoin("https://www.educh.ch", href)
-            title, location, taux, company = _parse_educh_anchor(
-                a.get_text(" ", strip=True))
-            fields = {"company": company or "—", "source": "educh.ch",
-                      "location": location or "Genève"}
-            if taux:
-                fields["taux"] = taux
-            consider(title, href, fields, jobs, seen_urls)
+            fields = {
+                "company": offer["company"],
+                "source": "educh.ch",
+                "location": offer["location"],
+            }
+            if offer["taux"]:
+                fields["taux"] = offer["taux"]
+            consider(
+                offer["title"], offer["url"], fields, jobs, seen_urls
+            )
     if raw_links == 0:
         log("⚠️  educh.ch: 0 lien d'offre extrait — sélecteur potentiellement cassé")
     log(f"educh.ch: {len(jobs)} offre(s) trouvée(s)")
@@ -2830,8 +4107,6 @@ def scrape_itboard() -> list:
 
 def scrape_cern() -> list:
     """CERN Careers — offres du site de Meyrin/Genève."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
     LIST_URL = "https://careers.cern/jobs/"
     DETAIL_RE = re.compile(r"^/jobs/[^/]+/?$")
     SOURCE = "careers.cern"
@@ -2854,8 +4129,6 @@ def scrape_cern() -> list:
 
 def scrape_icrc() -> list:
     """CICR — opportunités du siège à Genève (SAP SuccessFactors)."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
     LIST_URL = "https://careers.icrc.org/go/HQ-Opportunities/8821401/"
     DETAIL_RE = re.compile(r"/job/")
     SOURCE = "careers.icrc.org"
@@ -2876,63 +4149,66 @@ def scrape_icrc() -> list:
     return jobs
 
 
+_WIPO_SWISS_RE = _compile_terms(
+    ("switzerland", "suisse", "schweiz"), inflect=False
+)
+
+
+def _parse_wipo_listing(html: str, base_url: str) -> list:
+    """Extrait les fiches de la liste unifiée Taleo, sans accès réseau."""
+    soup = BeautifulSoup(html, "lxml")
+    offers, seen = [], set()
+    for anchor in soup.select("a[href*='jobdetail.ftl'][href*='job=']"):
+        title = _job_anchor_title(anchor)
+        url = urljoin(base_url, anchor.get("href", ""))
+        key = canonical_url(url)
+        if not title or key in seen:
+            continue
+        location = ""
+        node = anchor
+        for _ in range(6):
+            node = getattr(node, "parent", None)
+            if node is None:
+                break
+            context = node.get_text(" ", strip=True)
+            if len(context) > 1000:
+                break
+            context_norm = normalize(context)
+            context_geo = structured_geography(context)
+            if context_geo["status"] == "target":
+                location = context_geo["evidence"].title()
+                break
+            if context_geo["status"] == "outside":
+                location = context_geo["evidence"]
+                break
+            if term_in(context_norm, _WIPO_SWISS_RE):
+                # Le site suisse de WIPO correspond à son siège genevois ; les
+                # bureaux extérieurs sont, eux, nommés par pays/ville.
+                location = "Genève"
+                break
+        seen.add(key)
+        offers.append({"title": title, "url": url, "location": location})
+    return offers
+
+
 def scrape_wipo() -> list:
-    """OMPI/WIPO — flux RSS officiels du portail Oracle Taleo."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
-    FEEDS = (
-        "https://wipo.taleo.net/careersection/wp_1/jobsearch.rss?lang=en",
-        ("https://wipo.taleo.net/careersection/wp_2_pd/jobsearch.rss"
-         "?lang=en&portal=50305027338"),
-    )
+    """OMPI/WIPO — liste unifiée officielle du portail Oracle Taleo."""
+    LIST_URL = "https://wipo.taleo.net/careersection/wp_1/moresearch.ftl?lang=en"
     SOURCE = "wipo.taleo.net"
     jobs, seen_urls = [], set()
     mark_raw_source(SOURCE)
-    for feed_url in FEEDS:
-        if not robots_allows(feed_url):
-            continue
-        try:
-            _polite_wait(feed_url)
-            r = session().get(feed_url, timeout=20)
-            if r.status_code != 200:
-                continue
-            xml = BeautifulSoup(r.content, "xml")
-            for item in xml.select("item"):
-                title_el, link_el = item.find("title"), item.find("link")
-                if not title_el or not link_el:
-                    continue
-                title = re.sub(r"^Job Description\s*-\s*", "",
-                               title_el.get_text(" ", strip=True), flags=re.I)
-                link = link_el.get_text(strip=True)
-                desc_el = item.find("description")
-                desc = desc_el.get_text(" ", strip=True) if desc_el else ""
-                desc_norm = normalize(desc)
-                if ("duty station" in desc_norm
-                        and not any(place in desc_norm for place in
-                                    ("geneva", "geneve", "switzerland", "suisse"))):
-                    continue
-                consider(title, link,
-                         {"company": "OMPI / WIPO", "source": SOURCE,
-                          "location": "Genève"}, jobs, seen_urls)
-        except Exception as e:
-            log(f"WIPO RSS: {e}")
-    if not jobs:
-        # Repli Taleo : certaines configurations désactivent le RSS tout en
-        # laissant la liste HTML publique.
-        search_urls = (
-            "https://wipo.taleo.net/careersection/wp_1/jobsearch.ftl?lang=en",
-            ("https://wipo.taleo.net/careersection/wp_2_pd/jobsearch.ftl"
-             "?lang=en&portal=50305027338"),
-        )
-        for search_url in search_urls:
-            soup = fetch(search_url)
-            if not soup:
-                continue
-            for a in soup.select("a[href*='jobdetail.ftl'][href*='job=']"):
-                title = _job_anchor_title(a)
-                consider(title, urljoin(search_url, a.get("href", "")),
-                         {"company": "OMPI / WIPO", "source": SOURCE,
-                          "location": "Genève"}, jobs, seen_urls)
+    soup = fetch(LIST_URL)
+    if soup:
+        for offer in _parse_wipo_listing(str(soup), LIST_URL):
+            # La liste WIPO contient aussi des bureaux extérieurs. On n'invente
+            # donc pas Genève : l'enrichissement lit le « Duty Station » de la
+            # fiche, puis la géographie structurée tranche.
+            consider(
+                offer["title"], offer["url"],
+                {"company": "OMPI / WIPO", "source": SOURCE,
+                 "location": offer["location"]},
+                jobs, seen_urls,
+            )
     log(f"WIPO Careers: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
@@ -2946,7 +4222,7 @@ def scrape_job_room() -> list:
     jobs, seen_urls = [], set()
     mark_raw_source(SOURCE)
     if not PLAYWRIGHT_AVAILABLE:
-        log("Job-Room : Chromium système introuvable — source ignorée")
+        log("Job-Room : Playwright non installé — source ignorée")
         return jobs
     if not robots_allows(LIST_URL):
         return jobs
@@ -2992,16 +4268,16 @@ def scrape_job_room() -> list:
             consider(title, urljoin(LIST_URL, href),
                      {"company": _company_from_card(card), "source": SOURCE,
                       "location": card_text[:160]}, jobs, seen_urls)
+    except PlaywrightBrowserUnavailable:
+        raise
     except Exception as e:
-        log(f"Job-Room: {e}")
+        _log_playwright_failure(LIST_URL, e)
     log(f"Job-Room: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
 def scrape_sig() -> list:
     """Services industriels de Genève — listing SuccessFactors public."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
     URLS = (
         "https://jobs.sig-ge.ch/go/Nos-offres-d%27emploi/4179501/",
         ("https://jobs.sig-ge.ch/go/Nos-offres-d%26apos%3Bemploi/4179501/10/"
@@ -3026,8 +4302,6 @@ def scrape_sig() -> list:
 
 def scrape_tpg() -> list:
     """Transports publics genevois — portail SuccessFactors rendu en JavaScript."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
     LIST_URL = (
         "https://career5.successfactors.eu/career?company=transpor01"
         "&career_ns=job_listing_summary&navBarLevel=JOB_SEARCH"
@@ -3056,8 +4330,6 @@ def scrape_tpg() -> list:
 
 def scrape_un_geneva() -> list:
     """ONU Genève — liste publique du portail UN Careers rendu côté client."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
     LIST_URL = "https://careers.un.org/jobopening?language=en"
     SELECTOR = "a[href*='/jobSearchDescription/']"
     SOURCE = "careers.un.org"
@@ -3083,8 +4355,6 @@ def scrape_un_geneva() -> list:
 
 def scrape_wto() -> list:
     """OMC/WTO — API JSON publique utilisée par le portail Workday."""
-    if ACTIVE_PROFILE != "systemes":
-        return []
     API_URL = "https://wto.wd103.myworkdayjobs.com/wday/cxs/wto/External/jobs"
     PUBLIC_BASE = "https://wto.wd103.myworkdayjobs.com/en-US/External"
     SOURCE = "wto.org"
@@ -3093,16 +4363,7 @@ def scrape_wto() -> list:
     if not robots_allows(API_URL):
         return jobs
     try:
-        _polite_wait(API_URL)
-        r = session().post(
-            API_URL,
-            json={"appliedFacets": {}, "limit": 100, "offset": 0, "searchText": ""},
-            headers={**HEADERS, "Accept": "application/json",
-                     "Content-Type": "application/json"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        for item in r.json().get("jobPostings", []):
+        for item in _workday_job_postings(API_URL):
             title = str(item.get("title", "")).strip()
             path = item.get("externalPath", "")
             if not title or not path:
@@ -3113,6 +4374,257 @@ def scrape_wto() -> list:
     except Exception as e:
         log(f"WTO Workday: {e}")
     log(f"WTO Careers: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def _workday_job_postings(api_url: str, page_size: int = 20,
+                          max_results: int = 500) -> list:
+    """Lit un portail Workday CXS avec sa taille de page réellement acceptée.
+
+    Les endpoints CXS actuellement utilisés par WTO et Lombard Odier refusent
+    les requêtes à 100 éléments avec HTTP 400. Le client web Workday pagine par
+    blocs de 20 ; on suit ce contrat et on s'arrête au total annoncé.
+    """
+    page_size = max(1, min(int(page_size), 20))
+    postings = []
+    for offset in range(0, max_results, page_size):
+        _polite_wait(api_url)
+        response = session().post(
+            api_url,
+            json={"appliedFacets": {}, "limit": page_size, "offset": offset,
+                  "searchText": ""},
+            headers={**HEADERS, "Accept": "application/json",
+                     "Content-Type": "application/json"},
+            timeout=25,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        page = payload.get("jobPostings", [])
+        postings.extend(page)
+        total = int(payload.get("total", len(postings)) or 0)
+        if len(page) < page_size or len(postings) >= total:
+            break
+    return postings
+
+
+def _platform_source_terms(source: str, default_terms: list) -> list:
+    """Termes courts pour plateformes internationales, adaptés au profil actif."""
+    return source_terms(source, default_terms)
+
+
+def _reliefweb_items(query: str) -> list:
+    api_url = f"https://api.reliefweb.int/v2/jobs?appname={quote(RELIEFWEB_APPNAME)}"
+    payload = {
+        "profile": "list",
+        "preset": "latest",
+        "limit": 50,
+        "query": {"value": query, "operator": "AND"},
+        "filter": {
+            "conditions": [
+                {"field": "country", "value": "Switzerland"},
+            ]
+        },
+        "fields": {
+            "include": [
+                "title", "url", "body", "source", "country", "city", "date",
+            ]
+        },
+    }
+    _polite_wait(api_url)
+    response = session().post(
+        api_url,
+        json=payload,
+        headers={**HEADERS, "Accept": "application/json",
+                 "Content-Type": "application/json"},
+        timeout=25,
+    )
+    response.raise_for_status()
+    return response.json().get("data", [])
+
+
+def _reliefweb_names(value) -> list:
+    if isinstance(value, list):
+        return [
+            str(item.get("name", "") if isinstance(item, dict) else item).strip()
+            for item in value
+            if str(item.get("name", "") if isinstance(item, dict) else item).strip()
+        ]
+    if isinstance(value, dict):
+        name = str(value.get("name", "")).strip()
+        return [name] if name else []
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def scrape_reliefweb() -> list:
+    """ReliefWeb Jobs — ONG/organisations internationales avec pays Suisse."""
+    SOURCE = "reliefweb.int"
+    default_terms = [
+        "communication", "communications", "editor", "editorial",
+        "knowledge management", "information management", "records management",
+        "publishing", "translation", "social media",
+    ]
+    jobs, seen_urls = [], set()
+    mark_raw_source(SOURCE)
+    if not RELIEFWEB_APPNAME:
+        log(
+            "ReliefWeb : RELIEFWEB_APPNAME pré-approuvé absent — "
+            "source ignorée"
+        )
+        return jobs
+    for term in _platform_source_terms("reliefweb", default_terms):
+        mark_query(SOURCE, term)
+        try:
+            for item in _reliefweb_items(term):
+                fields = item.get("fields", {})
+                title = str(fields.get("title", "")).strip()
+                url = str(fields.get("url", "")).strip()
+                if not title or not url:
+                    continue
+                cities = _reliefweb_names(fields.get("city"))
+                countries = _reliefweb_names(fields.get("country"))
+                sources = _reliefweb_names(fields.get("source"))
+                location = ", ".join(cities + countries) or "Suisse"
+                company = sources[0] if sources else "ReliefWeb"
+                consider(
+                    title, url,
+                    {"company": company, "source": SOURCE, "location": location,
+                     "description": fields.get("body", ""), "_query": term},
+                    jobs, seen_urls,
+                )
+        except Exception as e:
+            log(f"ReliefWeb [{term}]: {e}")
+    log(f"ReliefWeb: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def _generic_job_cards_from_links(soup: BeautifulSoup, base_url: str):
+    """Itère sur des cartes d'emploi best-effort pour plateformes sans API stable."""
+    seen = set()
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if not href or href.startswith(("mailto:", "tel:", "#")):
+            continue
+        full_url = urljoin(base_url, href)
+        haystack = normalize(" ".join((href, a.get_text(" ", strip=True))))
+        if not any(token in haystack for token in (
+            "job", "jobs", "career", "careers", "vacancy", "vacancies",
+            "emploi", "offre", "poste", "recruit",
+        )):
+            continue
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        card = _job_card(a)
+        card_text = card.get_text(" ", strip=True) if card else a.get_text(" ", strip=True)
+        title = _job_anchor_title(a)
+        if not title or len(title) < 5 or len(title) > 180:
+            continue
+        if normalize(title) in {"jobs", "job", "careers", "career opportunities"}:
+            continue
+        yield title, full_url, card, card_text
+
+
+def _parse_cagi_page(html: str, base_url: str) -> list:
+    """Extrait uniquement les vraies fiches `/job/<slug>/` du listing CAGI."""
+    soup = BeautifulSoup(html, "lxml")
+    offers, seen = [], set()
+    for anchor in soup.select("a[href]"):
+        full_url = urljoin(base_url, anchor.get("href", ""))
+        path = urlparse(full_url).path
+        if not re.fullmatch(r"/job/[^/]+/?", path):
+            continue
+        title = _job_anchor_title(anchor)
+        key = canonical_url(full_url)
+        if not title or len(title) < 5 or key in seen:
+            continue
+        card = _job_card(anchor)
+        card_text = card.get_text(" ", strip=True) if card else title
+        location = extract_location_hint(card_text)
+        seen.add(key)
+        offers.append({
+            "title": title,
+            "url": full_url,
+            "location": location,
+            "company": (
+                _company_from_card(card, "") or extract_employer(card_text) or "CAGI"
+            ),
+            "description": card_text[:1200],
+        })
+    return offers
+
+
+def scrape_cagi() -> list:
+    """CAGI Recruitment Platform — offres ONG/Genève internationale."""
+    SOURCE = "jobs.cagi.ch"
+    # La page d'accueil `/` déclenche un mur anti-bot et maintient des connexions
+    # qui empêchent `networkidle`. Ce listing officiel localisé est rendu côté
+    # serveur et expose directement les fiches courantes.
+    LIST_URL = "https://jobs.cagi.ch/fr/offres-demploi/"
+    jobs, seen_urls = [], set()
+    mark_raw_source(SOURCE)
+    first_page = fetch(LIST_URL)
+    if not first_page:
+        first_page = fetch_via_playwright(
+            LIST_URL, wait_selector="a[href*='/job/']"
+        )
+    if not first_page:
+        return jobs
+
+    pages = [(LIST_URL, first_page)]
+    page_numbers = [
+        int(match.group(1))
+        for anchor in first_page.select("a[href]")
+        if (match := re.search(
+            r"/fr/offres-demploi/page/(\d+)/?",
+            urlparse(urljoin(LIST_URL, anchor.get("href", ""))).path,
+        ))
+    ]
+    last_page = min(max(page_numbers, default=1), 5)
+    for number in range(2, last_page + 1):
+        page_url = f"{LIST_URL}page/{number}/"
+        soup = fetch(page_url)
+        if soup:
+            pages.append((page_url, soup))
+
+    for page_url, soup in pages:
+        for offer in _parse_cagi_page(str(soup), page_url):
+            consider(
+                offer["title"], offer["url"],
+                {"company": offer["company"], "source": SOURCE,
+                 "location": offer["location"],
+                 "description": offer["description"]},
+                jobs, seen_urls,
+            )
+    log(f"CAGI: {len(jobs)} offre(s) trouvée(s)")
+    return jobs
+
+
+def scrape_cinfo() -> list:
+    """cinfoPoste — portail suisse de la coopération internationale."""
+    SOURCE = "cinfo.ch"
+    LIST_URLS = (
+        "https://www.cinfo.ch/en/jobs",
+        "https://www.cinfo.ch/fr/jobs",
+    )
+    jobs, seen_urls = [], set()
+    mark_raw_source(SOURCE)
+    for list_url in LIST_URLS:
+        soup = fetch(list_url)
+        if not soup:
+            continue
+        for title, full_url, card, card_text in _generic_job_cards_from_links(soup, list_url):
+            location = extract_location_hint(card_text)
+            if not location and term_in(normalize(card_text), _GEO_OK_RE):
+                location = "Genève"
+            company = _company_from_card(card, "") or extract_employer(card_text) or "cinfo"
+            consider(
+                title, full_url,
+                {"company": company, "source": SOURCE, "location": location or "Suisse",
+                 "description": card_text[:1200]},
+                jobs, seen_urls,
+            )
+    log(f"cinfoPoste: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
 
@@ -3228,8 +4740,9 @@ def scrape_linkedin_alert_emails() -> list:
     jobs, seen_urls = [], set()
     mark_raw_source(source)
     if not all((LINKEDIN_IMAP_HOST, LINKEDIN_IMAP_USER, LINKEDIN_IMAP_PASS)):
+        log("Alertes LinkedIn par email : configuration absente — source ignorée")
         return jobs
-    since = (datetime.now() - timedelta(days=max(1, LINKEDIN_IMAP_DAYS))).strftime(
+    since = (local_now() - timedelta(days=max(1, LINKEDIN_IMAP_DAYS))).strftime(
         "%d-%b-%Y"
     )
     try:
@@ -3285,31 +4798,20 @@ def _scrape_workday_source(config: dict, jobs: list, seen_urls: set):
     tenant, site = config["tenant"], config["site"]
     api_url = f"{host}/wday/cxs/{tenant}/{site}/jobs"
     public_base = config.get("public_base", f"{host}/en-US/{site}").rstrip("/")
-    for offset in range(0, 500, 100):
-        _polite_wait(api_url)
-        response = session().post(
-            api_url,
-            json={"appliedFacets": {}, "limit": 100, "offset": offset,
-                  "searchText": ""},
-            headers={**HEADERS, "Accept": "application/json",
-                     "Content-Type": "application/json"},
-            timeout=25,
+    for item in _workday_job_postings(
+        api_url, page_size=config.get("page_size", 20)
+    ):
+        title, path = str(item.get("title", "")).strip(), item.get("externalPath", "")
+        if not title or not path:
+            continue
+        consider(
+            title, urljoin(public_base + "/", str(path).lstrip("/")),
+            {"company": config["name"], "source": config["source"],
+             "location": item.get("locationsText", ""),
+             "external_id": str(path).rstrip("/").rsplit("/", 1)[-1],
+             "_health_source": "Portails ATS directs"},
+            jobs, seen_urls,
         )
-        response.raise_for_status()
-        payload = response.json()
-        postings = payload.get("jobPostings", [])
-        for item in postings:
-            title, path = str(item.get("title", "")).strip(), item.get("externalPath", "")
-            if not title or not path:
-                continue
-            consider(
-                title, urljoin(public_base + "/", str(path).lstrip("/")),
-                {"company": config["name"], "source": config["source"],
-                 "location": item.get("locationsText", "")},
-                jobs, seen_urls,
-            )
-        if len(postings) < 100 or offset + len(postings) >= payload.get("total", 0):
-            break
 
 
 def _smartrecruiters_location(value) -> str:
@@ -3357,7 +4859,9 @@ def _scrape_smartrecruiters_source(config: dict, jobs: list, seen_urls: set):
             consider(
                 title, url,
                 {"company": config["name"], "source": config["source"],
-                 "location": _smartrecruiters_location(item.get("location"))},
+                 "location": _smartrecruiters_location(item.get("location")),
+                 "external_id": posting_id,
+                 "_health_source": "Portails ATS directs"},
                 jobs, seen_urls,
             )
         offset += len(postings)
@@ -3368,6 +4872,7 @@ def _scrape_smartrecruiters_source(config: dict, jobs: list, seen_urls: set):
 def scrape_configured_ats() -> list:
     """Interroge les portails carrière publics listés dans ats_sources.json."""
     jobs, seen_urls = [], set()
+    mark_raw_source("Portails ATS directs")
     adapters = {
         "workday": _scrape_workday_source,
         "smartrecruiters": _scrape_smartrecruiters_source,
@@ -3396,30 +4901,18 @@ def scrape_configured_ats() -> list:
 # ---------------------------------------------------------------------------
 
 def load_health() -> dict:
-    if HEALTH_FILE.exists():
-        try:
-            return json.loads(HEALTH_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    health = _load_json_file(HEALTH_FILE, {})
+    return health if isinstance(health, dict) else {}
 
 
 def save_health(health: dict):
-    HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-
-
-# Sources connues comme dormantes (domaine hors-ligne / mur anti-bot persistant,
-# ou board fonctionnel mais quasi sans offre FR/romande — ex. bibliosuisse).
-# On continue de suivre leur santé, mais sans émettre d'alerte de bruit tant
-# qu'on ne les a pas réparées/repointées (elles restent dans SCRAPERS).
-# NB : « educa » a été repointé vers recrutement.hesge.ch (source vivante) → retiré
-# d'ici pour que le canari de santé le surveille de nouveau.
-HEALTH_SILENT_SOURCES = {"indeed_pw", "jobs_ch_pw", "bibliosuisse"}
+    _atomic_write_json(HEALTH_FILE, health)
 
 
 def update_health(source: str, count: int, health: dict,
-                  raw: int = None, source_field: str = None) -> list:
+                  raw: int = None, source_field: str = None,
+                  status: str = "ok", duration_ms: int | None = None,
+                  error: str = "") -> list:
     """Met à jour l'historique et renvoie des alertes si une source dégénère.
 
     `raw` = nb de candidats BRUTS extraits (avant filtrage) si connu : distingue un
@@ -3434,12 +4927,39 @@ def update_health(source: str, count: int, health: dict,
     entry["total"] += count
     entry["last"] = count
     entry["max"] = max(entry["max"], count)
+    now = local_now().isoformat()
+    entry["updated_at"] = now
+    entry["last_status"] = status
+    if duration_ms is not None:
+        entry["duration_ms"] = max(0, int(duration_ms))
+    if status == "error":
+        entry["consecutive_failures"] = entry.get("consecutive_failures", 0) + 1
+        entry["last_error"] = str(error or "échec sans détail")[:500]
+    elif status == "disabled":
+        entry["consecutive_failures"] = 0
+        entry["last_error"] = str(error or "source non configurée")[:500]
+    else:
+        entry["consecutive_failures"] = 0
+        entry["last_success_at"] = now
+        if error:
+            entry["last_error"] = str(error)[:500]
+        else:
+            entry.pop("last_error", None)
     if source_field:
         entry["source_field"] = source_field
     if raw is not None:
         entry["raw_last"] = raw
         entry["raw_max"] = max(entry.get("raw_max", 0), raw)
     health[source] = entry
+    if status == "error":
+        if entry["consecutive_failures"] == 1:
+            alerts.append(
+                f"🚨 {source_field or source} : exécution en échec"
+                + (f" — {entry['last_error']}" if entry.get("last_error") else ".")
+            )
+        return alerts
+    if status == "disabled":
+        return alerts
     if source in HEALTH_SILENT_SOURCES:
         return alerts          # suivi conservé, mais pas d'alerte (source en sommeil)
     label = source_field or source
@@ -3523,7 +5043,7 @@ def _nav_html(active: str = "", prefix: str = "") -> str:
 
 def _age_label(found_at: str) -> str:
     try:
-        days = max(0, (datetime.now() - datetime.fromisoformat(found_at)).days)
+        days = max(0, (local_now() - parse_local_datetime(found_at)).days)
     except (TypeError, ValueError):
         return "Date inconnue"
     if days == 0:
@@ -3544,7 +5064,7 @@ def _score_label(score: int) -> str:
 
 
 def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = None):
-    now = datetime.now().strftime("%d/%m/%Y à %H:%M")
+    now = local_now().strftime("%d/%m/%Y à %H:%M")
     all_jobs = deduplicate_jobs(all_jobs)
     strict_ids = {job_id(job.get("title", ""), job.get("url", "")) for job in all_jobs}
     review_jobs = [
@@ -3564,7 +5084,10 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
     def rows(job_list, is_new=False, is_review=False):
         output = []
         for job in job_list:
-            jid = job_id(job.get("title", ""), job.get("url", ""))
+            legacy_jid = legacy_job_id(
+                job.get("title", ""), job.get("url", "")
+            )
+            jid = tracking_id(job)
             title = clean_job_title(job.get("title", ""))
             company = job_employer(job) or "—"
             location = display_location(job.get("location", ""))
@@ -3572,7 +5095,7 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
             score = int(job.get("score", 0) or 0)
             found_at = job.get("found_at", "")
             try:
-                found_date = datetime.fromisoformat(found_at).strftime("%d.%m.%Y")
+                found_date = parse_local_datetime(found_at).strftime("%d.%m.%Y")
             except (TypeError, ValueError):
                 found_date = "—"
             keywords = matched_keywords(job)
@@ -3582,6 +5105,11 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
             for value in (job_contract(job), job_work_mode(job)):
                 if value and value not in details:
                     details.append(value)
+            if job.get("salary"):
+                details.append(f"Salaire {job['salary']}")
+            posted_date = job_posted_date(job)
+            if posted_date:
+                details.append(f"Publiée {posted_date}")
             deadline = job_deadline(job)
             if deadline:
                 details.append(f"Échéance {deadline}")
@@ -3602,7 +5130,8 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
             search_text = " ".join((title, company, location, source, " ".join(keywords)))
             output.append(
                 f'<tr class="job-row{" new" if is_new else ""}{" review" if is_review else ""}" '
-                f'data-id="{jid}" data-search="{escape(normalize(search_text))}" '
+                f'data-id="{jid}" data-legacy-id="{legacy_jid}" '
+                f'data-search="{escape(normalize(search_text))}" '
                 f'data-source="{escape(source)}" data-location="{escape(location)}" '
                 f'data-company="{escape(company)}" data-score="{score}" '
                 f'data-date="{escape(found_at)}" data-title="{escape(normalize(title))}">'
@@ -3716,8 +5245,8 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
 <script src="../assets/report.js" defer></script>
 </body></html>"""
 
-    RESULTS_FILE.write_text(html, encoding="utf-8")
-    PUBLIC_FILE.write_text(html, encoding="utf-8")
+    _atomic_write_text(RESULTS_FILE, html)
+    _atomic_write_text(PUBLIC_FILE, html)
     log(f"Rapport HTML mis à jour : {RESULTS_FILE}")
 
 
@@ -3733,12 +5262,12 @@ def generate_rss(all_jobs: list):
         src = escape(j.get("source", ""))
         loc = escape(display_location(j.get("location", "")))
         try:
-            pub_dt = datetime.fromisoformat(j["found_at"])
+            pub_dt = parse_local_datetime(j["found_at"])
         except (KeyError, ValueError):
-            pub_dt = datetime.now()
-        # Les dates stockées sont locales et naïves ; astimezone() les convertit
-        # avec le fuseau système pour produire un offset RSS correct.
-        pub_date = pub_dt.astimezone().strftime("%a, %d %b %Y %H:%M:%S %z")
+            pub_dt = local_now()
+        pub_date = pub_dt.astimezone(LOCAL_TIMEZONE).strftime(
+            "%a, %d %b %Y %H:%M:%S %z"
+        )
         items += (
             f"<item><title>{title}</title><link>{link}</link>"
             f"<pubDate>{pub_date}</pubDate>"
@@ -3755,7 +5284,7 @@ def generate_rss(all_jobs: list):
         f"{items}"
         "</channel></rss>"
     )
-    RSS_FILE.write_text(rss, encoding="utf-8")
+    _atomic_write_text(RSS_FILE, rss)
 
 
 SITE_CSS = r"""
@@ -3776,12 +5305,13 @@ REPORT_JS = r"""
 const body=document.body,profile=body.dataset.profile||'global',storageKey=`find-job:v2:${profile}`,byId=id=>document.getElementById(id),rows=()=>[...document.querySelectorAll('.job-row')];
 const normalize=value=>(value||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();let state={jobs:{}};try{state=JSON.parse(localStorage.getItem(storageKey))||state}catch(_e){}if(!state.jobs)state.jobs={};
 const save=()=>localStorage.setItem(storageKey,JSON.stringify(state)),record=id=>state.jobs[id]||(state.jobs[id]={favorite:false,status:'',hidden:false});
-function paintRow(row){const item=record(row.dataset.id),favorite=row.querySelector('.favorite'),status=row.querySelector('.job-status'),hide=row.querySelector('.hide-job');row.classList.toggle('is-favorite',!!item.favorite);row.classList.toggle('is-hidden',!!item.hidden);favorite.textContent=item.favorite?'★':'☆';favorite.setAttribute('aria-label',item.favorite?'Retirer des favoris':'Ajouter aux favoris');favorite.title=favorite.getAttribute('aria-label');hide.textContent=item.hidden?'Réafficher':'Masquer';hide.title=item.hidden?'Réafficher cette offre':'Masquer cette offre';status.value=item.status||'';row.dataset.status=item.status||'review'}rows().forEach(paintRow);
-document.addEventListener('click',event=>{const favorite=event.target.closest('.favorite'),hide=event.target.closest('.hide-job');if(favorite){const row=favorite.closest('.job-row'),item=record(row.dataset.id);item.favorite=!item.favorite;paintRow(row);save();applyFilters()}if(hide){const row=hide.closest('.job-row'),item=record(row.dataset.id);item.hidden=!item.hidden;paintRow(row);save();applyFilters()}});
-document.addEventListener('change',event=>{if(event.target.matches('.job-status')){const row=event.target.closest('.job-row');record(row.dataset.id).status=event.target.value;paintRow(row);save();applyFilters()}});
+let migrated=false;const rowRecord=row=>{const id=row.dataset.id,legacy=row.dataset.legacyId;if(!state.jobs[id]&&legacy&&state.jobs[legacy]){state.jobs[id]=state.jobs[legacy];migrated=true}return record(id)};
+function paintRow(row){const item=rowRecord(row),favorite=row.querySelector('.favorite'),status=row.querySelector('.job-status'),hide=row.querySelector('.hide-job');row.classList.toggle('is-favorite',!!item.favorite);row.classList.toggle('is-hidden',!!item.hidden);favorite.textContent=item.favorite?'★':'☆';favorite.setAttribute('aria-label',item.favorite?'Retirer des favoris':'Ajouter aux favoris');favorite.title=favorite.getAttribute('aria-label');hide.textContent=item.hidden?'Réafficher':'Masquer';hide.title=item.hidden?'Réafficher cette offre':'Masquer cette offre';status.value=item.status||'';row.dataset.status=item.status||'review'}rows().forEach(paintRow);if(migrated)save();
+document.addEventListener('click',event=>{const favorite=event.target.closest('.favorite'),hide=event.target.closest('.hide-job');if(favorite){const row=favorite.closest('.job-row'),item=rowRecord(row);item.favorite=!item.favorite;paintRow(row);save();applyFilters()}if(hide){const row=hide.closest('.job-row'),item=rowRecord(row);item.hidden=!item.hidden;paintRow(row);save();applyFilters()}});
+document.addEventListener('change',event=>{if(event.target.matches('.job-status')){const row=event.target.closest('.job-row');rowRecord(row).status=event.target.value;paintRow(row);save();applyFilters()}});
 const controls=['search','location-filter','source-filter','score-filter','date-filter','status-filter','sort-select','favorites-only','show-hidden'];controls.forEach(id=>{const node=byId(id);node?.addEventListener(node.type==='search'?'input':'change',applyFilters)});
 function sortRows(value){const [key,direction]=value.split('-'),factor=direction==='asc'?1:-1;document.querySelectorAll('tbody').forEach(tbody=>{[...tbody.children].sort((a,b)=>{let av=a.dataset[key]||'',bv=b.dataset[key]||'';if(key==='score')return(Number(av)-Number(bv))*factor;return av.localeCompare(bv,'fr',{numeric:true,sensitivity:'base'})*factor}).forEach(row=>tbody.appendChild(row))});document.querySelectorAll('.sort-button').forEach(button=>{button.removeAttribute('data-direction');button.closest('th').removeAttribute('aria-sort')});const active=document.querySelector(`.sort-button[data-sort="${key}"]`);if(active){active.dataset.direction=direction;active.closest('th').setAttribute('aria-sort',direction==='asc'?'ascending':'descending')}}
-function applyFilters(){const query=normalize(byId('search').value),location=byId('location-filter').value,source=byId('source-filter').value,minScore=Number(byId('score-filter').value),days=Number(byId('date-filter').value),status=byId('status-filter').value,favorites=byId('favorites-only').checked,showHidden=byId('show-hidden').checked,cutoff=days?Date.now()-days*86400000:0;let visible=0;rows().forEach(row=>{const item=record(row.dataset.id),matches=(!query||row.dataset.search.includes(query))&&(!location||row.dataset.location===location)&&(!source||row.dataset.source===source)&&Number(row.dataset.score)>=minScore&&(!cutoff||new Date(row.dataset.date).getTime()>=cutoff)&&(!status||(item.status||'review')===status)&&(!favorites||item.favorite)&&(showHidden||!item.hidden);row.hidden=!matches;if(matches)visible++});document.querySelectorAll('.jobs-section').forEach(section=>{const count=[...section.querySelectorAll('.job-row')].filter(row=>!row.hidden).length;section.querySelector('[data-count]').textContent=count;section.querySelector('.table-wrap').hidden=count===0;section.querySelector('.section-empty').hidden=count!==0});byId('result-count').textContent=`${visible} offre${visible>1?'s':''} affichée${visible>1?'s':''}`;sortRows(byId('sort-select').value)}
+function applyFilters(){const query=normalize(byId('search').value),location=byId('location-filter').value,source=byId('source-filter').value,minScore=Number(byId('score-filter').value),days=Number(byId('date-filter').value),status=byId('status-filter').value,favorites=byId('favorites-only').checked,showHidden=byId('show-hidden').checked,cutoff=days?Date.now()-days*86400000:0;let visible=0;rows().forEach(row=>{const item=rowRecord(row),matches=(!query||row.dataset.search.includes(query))&&(!location||row.dataset.location===location)&&(!source||row.dataset.source===source)&&Number(row.dataset.score)>=minScore&&(!cutoff||new Date(row.dataset.date).getTime()>=cutoff)&&(!status||(item.status||'review')===status)&&(!favorites||item.favorite)&&(showHidden||!item.hidden);row.hidden=!matches;if(matches)visible++});document.querySelectorAll('.jobs-section').forEach(section=>{const count=[...section.querySelectorAll('.job-row')].filter(row=>!row.hidden).length;section.querySelector('[data-count]').textContent=count;section.querySelector('.table-wrap').hidden=count===0;section.querySelector('.section-empty').hidden=count!==0});byId('result-count').textContent=`${visible} offre${visible>1?'s':''} affichée${visible>1?'s':''}`;sortRows(byId('sort-select').value)}
 document.querySelectorAll('.sort-button').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.sort,current=button.dataset.direction||'',direction=current==='desc'?'asc':'desc';byId('sort-select').value=`${key}-${direction}`;applyFilters()}));
 byId('reset-filters')?.addEventListener('click',()=>{controls.forEach(id=>{const node=byId(id);if(!node)return;if(node.type==='checkbox')node.checked=false;else node.value=id==='sort-select'?'date-desc':''});byId('score-filter').value='0';byId('date-filter').value='0';applyFilters()});
 byId('export-tracking')?.addEventListener('click',()=>{const payload={version:2,profile,exportedAt:new Date().toISOString(),jobs:state.jobs},blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`suivi-candidatures-${profile}.json`;link.click();URL.revokeObjectURL(url)});
@@ -3794,40 +5324,56 @@ def generate_site_assets():
     """Écrit les ressources partagées et le mode hors-ligne de GitHub Pages."""
     assets = DOCS_ROOT / "assets"
     assets.mkdir(parents=True, exist_ok=True)
-    (assets / "site.css").write_text(SITE_CSS.strip() + "\n", encoding="utf-8")
-    (assets / "report.js").write_text(REPORT_JS.strip() + "\n", encoding="utf-8")
+    _atomic_write_text(assets / "site.css", SITE_CSS.strip() + "\n")
+    _atomic_write_text(assets / "report.js", REPORT_JS.strip() + "\n")
     manifest = {"name": "Veille emploi – Genève", "short_name": "Veille emploi", "start_url": "./", "display": "standalone", "background_color": "#f6f8fc", "theme_color": "#1d4ed8", "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]}
-    (DOCS_ROOT / "manifest.webmanifest").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        DOCS_ROOT / "manifest.webmanifest",
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    )
     icon = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="104" fill="#1d4ed8"/><path fill="white" d="M128 157h256v220H128z"/><path fill="#1d4ed8" d="M201 123h110a35 35 0 0 1 35 35v28h-31v-25a9 9 0 0 0-9-9H206a9 9 0 0 0-9 9v25h-31v-28a35 35 0 0 1 35-35zm-73 123h256v42H128z"/></svg>"""
-    (DOCS_ROOT / "icon.svg").write_text(icon, encoding="utf-8")
+    _atomic_write_text(DOCS_ROOT / "icon.svg", icon)
     cached = ["./", "./index.html", "./status.html", "./assets/site.css", "./assets/report.js", "./icon.svg", "./manifest.webmanifest"] + [f"./{profile}/" for profile in PROFILES]
     sw = "const CACHE='find-job-v2';const FILES=" + json.dumps(cached) + ";self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(FILES))));self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k))))));self.addEventListener('fetch',e=>{if(e.request.method!=='GET'||new URL(e.request.url).origin!==location.origin)return;e.respondWith(fetch(e.request).then(r=>{const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy));return r}).catch(()=>caches.match(e.request)))})\n"
-    (DOCS_ROOT / "sw.js").write_text(sw, encoding="utf-8")
+    _atomic_write_text(DOCS_ROOT / "sw.js", sw)
 
 
 def generate_status_page():
     """Publie les signaux permettant d'identifier une perte de couverture."""
+    status_labels = {
+        "ok": "OK",
+        "filtered": "Filtrée",
+        "empty": "Vide",
+        "warning": "Avertissement",
+        "disabled": "Désactivée",
+        "error": "Erreur",
+    }
     sections = []
     for profile, cfg in PROFILES.items():
         data_dir = DATA_ROOT / profile
-        try:
-            health = json.loads((data_dir / "health.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            health = {}
-        try:
-            coverage = json.loads((data_dir / "query_coverage.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            coverage = {}
-        try:
-            rejections = json.loads((data_dir / "rejections.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            rejections = {}
-        health_rows = "".join(
-            f"<tr><td>{escape(entry.get('source_field', name))}</td>"
-            f"<td>{entry.get('last', 0)}</td><td>{entry.get('raw_last', '—')}</td>"
-            f"<td>{entry.get('max', 0)}</td></tr>"
-            for name, entry in sorted(health.items())
-        ) or '<tr><td colspan="4">Aucune donnée disponible.</td></tr>'
+        health = _load_json_file(data_dir / "health.json", {})
+        coverage = _load_json_file(data_dir / "query_coverage.json", {})
+        rejections = _load_json_file(data_dir / "rejections.json", {})
+        health = health if isinstance(health, dict) else {}
+        coverage = coverage if isinstance(coverage, dict) else {}
+        rejections = rejections if isinstance(rejections, dict) else {}
+        health_rows_data = []
+        for name, entry in sorted(health.items()):
+            status = entry.get("last_status", "—")
+            duration = entry.get("duration_ms")
+            duration_label = f"{duration / 1000:.1f} s" if isinstance(duration, int) else "—"
+            last_success = str(entry.get("last_success_at", "")).replace("T", " ")[:16] or "—"
+            error = str(entry.get("last_error", ""))[:160] or "—"
+            health_rows_data.append(
+                f"<tr><td>{escape(entry.get('source_field', name))}</td>"
+                f"<td>{escape(status_labels.get(status, status))}</td>"
+                f"<td>{entry.get('last', 0)}</td><td>{entry.get('raw_last', '—')}</td>"
+                f"<td>{escape(duration_label)}</td><td>{escape(last_success)}</td>"
+                f"<td>{escape(error)}</td></tr>"
+            )
+        health_rows = "".join(health_rows_data) or (
+            '<tr><td colspan="7">Aucune donnée disponible.</td></tr>'
+        )
         silent_queries = [
             (*key.split("::", 1), entry)
             for key, entry in coverage.items() if entry.get("last") == 0
@@ -3844,43 +5390,52 @@ def generate_status_page():
             f"<tr><td>{escape(reason.replace('_', ' '))}</td><td>{count}</td></tr>"
             for reason, count in sorted(rejections.get("counts", {}).items())
         ) or '<tr><td colspan="2">Le prochain passage alimentera ce journal.</td></tr>'
+        by_source_rows_data = []
+        for source, counts in rejections.get("by_source", {}).items():
+            for reason, count in counts.items():
+                by_source_rows_data.append((count, source, reason))
+        by_source_rows = "".join(
+            f"<tr><td>{escape(source)}</td><td>{escape(reason.replace('_', ' '))}</td>"
+            f"<td>{count}</td></tr>"
+            for count, source, reason in sorted(
+                by_source_rows_data, key=lambda item: (-item[0], item[1], item[2])
+            )[:30]
+        ) or '<tr><td colspan="3">Le prochain passage alimentera ce journal.</td></tr>'
         sections.append(f"""<section class="panel status-profile"><h2>{escape(cfg['label'])}</h2>
-<h3>Sources</h3><div class="table-wrap"><table><thead><tr><th>Source</th><th>Offres retenues</th><th>Candidats bruts</th><th>Maximum</th></tr></thead><tbody>{health_rows}</tbody></table></div>
+<h3>Sources</h3><div class="table-wrap"><table><thead><tr><th>Source</th><th>État</th><th>Offres retenues</th><th>Candidats bruts</th><th>Durée</th><th>Dernier succès</th><th>Diagnostic</th></tr></thead><tbody>{health_rows}</tbody></table></div>
 <h3>Requêtes actuellement muettes</h3><div class="table-wrap"><table><thead><tr><th>Source</th><th>Requête</th><th>Passages à zéro</th><th>Maximum historique</th></tr></thead><tbody>{query_rows}</tbody></table></div>
-<h3>Motifs de rejet du dernier passage</h3><div class="table-wrap"><table><thead><tr><th>Motif</th><th>Nombre</th></tr></thead><tbody>{rejection_rows}</tbody></table></div></section>""")
+<h3>Motifs de rejet du dernier passage</h3><div class="table-wrap"><table><thead><tr><th>Motif</th><th>Nombre</th></tr></thead><tbody>{rejection_rows}</tbody></table></div>
+<h3>Rejets par source</h3><div class="table-wrap"><table><thead><tr><th>Source</th><th>Motif</th><th>Nombre</th></tr></thead><tbody>{by_source_rows}</tbody></table></div></section>""")
     html = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="État de couverture des sources de la veille emploi."><link rel="stylesheet" href="assets/site.css"><link rel="icon" href="icon.svg" type="image/svg+xml"><title>Couverture de la recherche</title></head>
 <body><header class="site-header"><div class="shell header-inner"><a class="brand" href="./">Veille emploi</a>{_nav_html('status')}<div class="header-actions"><button id="theme-toggle" class="icon-button" type="button">◐</button></div></div></header>
 <main class="shell"><section class="hero"><div><p class="eyebrow">Diagnostic</p><h1>Couverture de la recherche</h1><p class="updated">Cette page permet de repérer une source cassée, une requête devenue muette ou un filtre trop strict.</p></div></section>{''.join(sections)}</main>
 <script>document.getElementById('theme-toggle').addEventListener('click',()=>{{const d=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=d?'dark':'';localStorage.setItem('find-job:theme',d?'dark':'light')}});if(localStorage.getItem('find-job:theme')==='dark')document.documentElement.dataset.theme='dark';</script></body></html>"""
-    (DOCS_ROOT / "status.html").write_text(html, encoding="utf-8")
+    _atomic_write_text(DOCS_ROOT / "status.html", html)
 
 
 def generate_portal_index():
     """Tableau de bord des profils avec compteurs et dernières offres."""
     generate_site_assets()
     generate_status_page()
-    now = datetime.now()
+    now = local_now()
     cards = []
     for profile, cfg in PROFILES.items():
         path = DATA_ROOT / profile / "all_jobs.json"
-        jobs = []
-        if path.exists():
-            try:
-                jobs = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                jobs = []
+        jobs = _load_json_file(path, [])
+        if not isinstance(jobs, list):
+            jobs = []
         jobs = deduplicate_jobs(jobs)
         review_path = DATA_ROOT / profile / "review_jobs.json"
-        try:
-            review_count = len(deduplicate_jobs(json.loads(review_path.read_text(encoding="utf-8"))))
-        except (OSError, json.JSONDecodeError):
-            review_count = 0
+        review_data = _load_json_file(review_path, [])
+        review_count = (
+            len(deduplicate_jobs(review_data)) if isinstance(review_data, list) else 0
+        )
         recent = sorted(jobs, key=lambda job: job.get("found_at", ""), reverse=True)
         added_24h = 0
         for job in jobs:
             try:
-                if now - datetime.fromisoformat(job.get("found_at", "")) <= timedelta(hours=24):
+                if now - parse_local_datetime(job.get("found_at", "")) <= timedelta(hours=24):
                     added_24h += 1
             except (TypeError, ValueError):
                 pass
@@ -3890,7 +5445,9 @@ def generate_portal_index():
             for job in recent[:3]
         ) or "<li>Aucune offre pour le moment.</li>"
         updated = (
-            datetime.fromtimestamp(path.stat().st_mtime).strftime("%d/%m/%Y à %H:%M")
+            datetime.fromtimestamp(path.stat().st_mtime, LOCAL_TIMEZONE).strftime(
+                "%d/%m/%Y à %H:%M"
+            )
             if path.exists() else "jamais"
         )
         cards.append(f"""<article class="profile-card">
@@ -3918,7 +5475,7 @@ def generate_portal_index():
 <footer><div class="shell">Les compteurs sont actualisés lors de chaque recherche automatique.</div></footer>
 <script>document.getElementById('theme-toggle').addEventListener('click',()=>{{const d=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=d?'dark':'';localStorage.setItem('find-job:theme',d?'dark':'light')}});if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{{}}));</script>
 </body></html>"""
-    (DOCS_ROOT / "index.html").write_text(html, encoding="utf-8")
+    _atomic_write_text(DOCS_ROOT / "index.html", html)
 
 
 # ---------------------------------------------------------------------------
@@ -3927,89 +5484,168 @@ def generate_portal_index():
 
 def load_all_jobs() -> list:
     p = DATA_DIR / "all_jobs.json"
-    if p.exists():
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    return []
+    jobs = _load_json_file(p, [])
+    return jobs if isinstance(jobs, list) else []
 
 
 def save_all_jobs(jobs: list):
     p = DATA_DIR / "all_jobs.json"
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(jobs, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(p, jobs)
 
 
 def load_review_jobs() -> list:
-    if REVIEW_FILE.exists():
-        try:
-            return json.loads(REVIEW_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return []
-    return []
+    jobs = _load_json_file(REVIEW_FILE, [])
+    return jobs if isinstance(jobs, list) else []
 
 
 def save_review_jobs(jobs: list):
-    REVIEW_FILE.write_text(
-        json.dumps(jobs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    _atomic_write_json(REVIEW_FILE, jobs)
 
 
-# Chaque scraper est isolé : s'il plante, les autres continuent.
-SCRAPERS = [
-    # Public / para-public
-    scrape_ville_geneve, scrape_ge_ch, scrape_vaud,
-    # Universités & recherche (NOUVEAU)
-    scrape_unige, scrape_myscience,
-    # Culture / enseignement spécialisés (NOUVEAU)
-    scrape_museums, scrape_educa, scrape_educh, scrape_bibliosuisse,
-    # Presse / privé
-    scrape_letemps, scrape_jobscout24, scrape_jobup,
-    # Agrégateurs
-    scrape_indeed_pw, scrape_adzuna, scrape_jobs_ch_pw,
-    # Alternatives conformes à LinkedIn : alertes email + ATS d'origine
-    scrape_linkedin_alert_emails, scrape_configured_ats,
-    # Systèmes & Linux : boards spécialisés et grands employeurs genevois
-    scrape_swissdevjobs, scrape_itjobs_ch, scrape_itboard,
-    scrape_cern, scrape_icrc, scrape_wipo, scrape_job_room,
-    scrape_sig, scrape_tpg, scrape_un_geneva, scrape_wto,
-]
+@dataclass(frozen=True)
+class SourceSpec:
+    """Fonction et politique opérationnelle d'une source, définies au même endroit."""
+    name: str
+    scraper: Callable[[], list]
+    source_field: str
+    profiles: frozenset[str] = frozenset()
+    requires_browser: bool = False
+    health_silent: bool = False
 
-SCRAPER_SOURCE_FIELDS = {
-    # Nom historique du scraper conservé, mais source réelle repointée.
-    "educa": "recrutement.hesge.ch",
-    "educh": "educh.ch",
-    "swissdevjobs": "swissdevjobs.ch",
-    "itjobs_ch": "itjobs.ch",
-    "itboard": "itboard.ch",
-    "cern": "careers.cern",
-    "icrc": "careers.icrc.org",
-    "wipo": "wipo.taleo.net",
-    "job_room": "job-room.ch",
-    "sig": "jobs.sig-ge.ch",
-    "tpg": "tpg.ch",
-    "un_geneva": "careers.un.org",
-    "wto": "wto.org",
-    "linkedin_alert_emails": "LinkedIn (alerte email)",
+    def enabled_for(self, profile: str) -> bool:
+        return not self.profiles or profile in self.profiles
+
+
+SYSTEMES_PROFILE = frozenset({"systemes"})
+
+# Registre unique : ajouter une source ne nécessite plus de synchroniser quatre listes.
+SOURCE_SPECS = (
+    SourceSpec("ville_geneve", scrape_ville_geneve, "geneve.ch"),
+    SourceSpec("ge_ch", scrape_ge_ch, "ge.ch"),
+    SourceSpec("vaud", scrape_vaud, "offres-emploi.vd.ch"),
+    SourceSpec("unige", scrape_unige, "jobs.unige.ch"),
+    SourceSpec("myscience", scrape_myscience, "myscience.ch", requires_browser=True),
+    SourceSpec("museums", scrape_museums, "museums.ch"),
+    SourceSpec("educa", scrape_educa, "recrutement.hesge.ch"),
+    SourceSpec("educh", scrape_educh, "educh.ch"),
+    SourceSpec("bibliosuisse", scrape_bibliosuisse, "bibliosuisse.ch", health_silent=True),
+    SourceSpec("letemps", scrape_letemps, "Le Temps Emploi"),
+    SourceSpec("jobscout24", scrape_jobscout24, "jobscout24.ch"),
+    SourceSpec("jobup", scrape_jobup, "jobup.ch"),
+    SourceSpec("indeed_pw", scrape_indeed_pw, "Indeed CH", requires_browser=True, health_silent=True),
+    SourceSpec("adzuna", scrape_adzuna, "Adzuna (Indeed+)"),
+    SourceSpec("jobs_ch_pw", scrape_jobs_ch_pw, "jobs.ch", requires_browser=True, health_silent=True),
+    SourceSpec("linkedin_alert_emails", scrape_linkedin_alert_emails, "LinkedIn (alerte email)"),
+    SourceSpec("configured_ats", scrape_configured_ats, "Portails ATS directs"),
+    SourceSpec("swissdevjobs", scrape_swissdevjobs, "swissdevjobs.ch", SYSTEMES_PROFILE),
+    SourceSpec("itjobs_ch", scrape_itjobs_ch, "itjobs.ch", SYSTEMES_PROFILE),
+    SourceSpec("itboard", scrape_itboard, "itboard.ch", SYSTEMES_PROFILE),
+    SourceSpec("cern", scrape_cern, "careers.cern"),
+    SourceSpec("icrc", scrape_icrc, "careers.icrc.org"),
+    SourceSpec("wipo", scrape_wipo, "wipo.taleo.net"),
+    SourceSpec("job_room", scrape_job_room, "job-room.ch", SYSTEMES_PROFILE, True),
+    SourceSpec("sig", scrape_sig, "jobs.sig-ge.ch"),
+    SourceSpec("tpg", scrape_tpg, "tpg.ch", requires_browser=True),
+    SourceSpec("un_geneva", scrape_un_geneva, "careers.un.org", requires_browser=True),
+    SourceSpec("wto", scrape_wto, "wto.org"),
+    SourceSpec("reliefweb", scrape_reliefweb, "reliefweb.int"),
+    SourceSpec("cagi", scrape_cagi, "jobs.cagi.ch", requires_browser=True),
+    SourceSpec("cinfo", scrape_cinfo, "cinfo.ch"),
+)
+
+# Alias dérivés conservés pour compatibilité avec les tests et appels ciblés.
+SCRAPERS = [spec.scraper for spec in SOURCE_SPECS]
+SCRAPER_SOURCE_FIELDS = {spec.name: spec.source_field for spec in SOURCE_SPECS}
+SYSTEMES_ONLY_SCRAPERS = tuple(
+    spec.scraper for spec in SOURCE_SPECS if spec.profiles == SYSTEMES_PROFILE
+)
+PLAYWRIGHT_SCRAPERS = tuple(
+    spec.scraper for spec in SOURCE_SPECS if spec.requires_browser
+)
+HEALTH_SILENT_SOURCES = {
+    spec.name for spec in SOURCE_SPECS if spec.health_silent
 }
 
-SYSTEMES_ONLY_SCRAPERS = (
-    scrape_swissdevjobs, scrape_itjobs_ch, scrape_itboard,
-    scrape_cern, scrape_icrc, scrape_wipo, scrape_job_room,
-    scrape_sig, scrape_tpg, scrape_un_geneva, scrape_wto,
-)
 
-# Sources rendues via Playwright : exécutées en séquence dans un seul thread (l'API
-# sync de Playwright ne supporte pas le parallélisme multi-thread), en parallèle du
-# pool HTTP. Voir la parallélisation dans main().
-PLAYWRIGHT_SCRAPERS = (
-    scrape_myscience, scrape_indeed_pw, scrape_jobs_ch_pw,
-    scrape_job_room, scrape_tpg, scrape_un_geneva,
-)
+def active_source_specs(profile: str) -> list[SourceSpec]:
+    return [spec for spec in SOURCE_SPECS if spec.enabled_for(profile)]
+
+
+def _run_source(spec: SourceSpec) -> list[dict]:
+    """Exécute une source isolément et conserve son résultat opérationnel."""
+    started = time.monotonic()
+    _SCRAPER_RUN_LOCAL.diagnostics = []
+    _SCRAPER_RUN_LOCAL.status_hint = ""
+    try:
+        results = spec.scraper()
+        if not isinstance(results, list):
+            raise TypeError(
+                f"{spec.scraper.__name__} doit renvoyer une liste, reçu "
+                f"{type(results).__name__}"
+            )
+        diagnostics = list(_SCRAPER_RUN_LOCAL.diagnostics)
+        status_hint = _SCRAPER_RUN_LOCAL.status_hint
+        return [{
+            "name": spec.name,
+            "results": results,
+            "status": status_hint or ("warning" if diagnostics else "ok"),
+            "error": " | ".join(diagnostics[-3:]),
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        }]
+    except PlaywrightBrowserUnavailable as exc:
+        message = _playwright_error_summary(exc)
+        log(f"{spec.scraper.__name__} : {message} — source ignorée")
+        return [{
+            "name": spec.name, "results": [], "status": "disabled",
+            "error": message,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        }]
+    except Exception as exc:
+        error_text = (
+            _playwright_error_summary(exc) if spec.requires_browser else str(exc)
+        )
+        log(f"⚠️  {spec.scraper.__name__} a échoué : {error_text}")
+        return [{
+            "name": spec.name, "results": [], "status": "error",
+            "error": f"{type(exc).__name__}: {error_text}",
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        }]
+    finally:
+        del _SCRAPER_RUN_LOCAL.diagnostics
+        del _SCRAPER_RUN_LOCAL.status_hint
+
+
+def collect_source_outcomes(profile: str) -> list[dict]:
+    """Parallélise HTTP et sérialise Playwright, indépendamment de la persistance."""
+    global _DEFER_DETAIL_FETCHES
+    specs = active_source_specs(profile)
+    browser_specs = [spec for spec in specs if spec.requires_browser]
+    http_specs = [spec for spec in specs if not spec.requires_browser]
+
+    def run_browser_group():
+        outcomes = []
+        for spec in browser_specs:
+            outcomes.extend(_run_source(spec))
+        return outcomes
+
+    collected = []
+    _DEFER_DETAIL_FETCHES = True
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(_run_source, spec) for spec in http_specs]
+            if browser_specs:
+                futures.append(pool.submit(run_browser_group))
+            for future in as_completed(futures):
+                collected.extend(future.result())
+    finally:
+        _DEFER_DETAIL_FETCHES = False
+    _process_pending_detail_candidates()
+    return collected
 
 
 def run_profile(profile: str):
     global _detail_fetch_count, _employer_fetch_count, _raw_counts
-    global _query_counts, _rejection_counts, _rejection_samples
+    global _query_counts, _rejection_counts, _rejection_samples, _rejection_by_source
     configure_profile(profile)
     bootstrap_legacy_profile_data()
     with _COUNTERS_LOCK:
@@ -4019,6 +5655,9 @@ def run_profile(profile: str):
         _query_counts = {}
         _rejection_counts = {}
         _rejection_samples = {}
+        _rejection_by_source = {}
+        _pending_detail_candidates.clear()
+    _load_detail_cache()
 
     log(f"=== Démarrage de la recherche d'emploi ({ACTIVE_PROFILE_CONFIG['label']}) ===")
     seen = load_seen()
@@ -4041,15 +5680,14 @@ def run_profile(profile: str):
     migrated_review = []
     for j in all_jobs:
         finalize(j)
-        if passes_filters(j):
+        decision = classify_job(j)
+        if decision["destination"] == "main":
             j.pop("review_reason", None)
             j.pop("_review", None)
             revalidated.append(j)
-        else:
-            keep, reasons = review_candidate(j)
-            if keep:
-                j["review_reason"] = "; ".join(reasons)
-                migrated_review.append(j)
+        elif decision["destination"] == "review":
+            j["review_reason"] = decision["reason"]
+            migrated_review.append(j)
     all_jobs = revalidated
     review_jobs.extend(migrated_review)
     purged = before - len(all_jobs)
@@ -4061,25 +5699,36 @@ def run_profile(profile: str):
     retained_review = []
     for job in review_jobs:
         finalize(job)
-        if passes_filters(job):
+        decision = classify_job(job)
+        if decision["destination"] == "main":
             job.pop("review_reason", None)
             job.pop("_review", None)
             job["_new"] = True
             all_jobs.append(job)
-        else:
-            keep, reasons = review_candidate(job)
-            if keep:
-                job["review_reason"] = "; ".join(reasons)
-                retained_review.append(job)
+        elif decision["destination"] == "review":
+            job["review_reason"] = decision["reason"]
+            retained_review.append(job)
     review_jobs = retained_review
 
     # Purge des liens morts : une offre dont la page renvoie 404/410 a été retirée
     # par la source et ne doit plus figurer dans le rapport (lien cassé).
     # Parallélisé (requêtes HEAD indépendantes) pour ne pas allonger le run.
     before = len(all_jobs)
+    jobs_to_check = [job for job in all_jobs if dead_link_check_due(job)]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        dead_flags = list(pool.map(lambda j: url_is_dead(j["url"]), all_jobs))
-    all_jobs = [j for j, is_dead in zip(all_jobs, dead_flags) if not is_dead]
+        dead_flags = list(pool.map(lambda j: url_is_dead(j["url"]), jobs_to_check))
+    checked_at = local_now().isoformat()
+    dead_urls = {
+        canonical_url(job["url"])
+        for job, is_dead in zip(jobs_to_check, dead_flags) if is_dead
+    }
+    for job, is_dead in zip(jobs_to_check, dead_flags):
+        if not is_dead:
+            job["url_checked_at"] = checked_at
+    all_jobs = [
+        job for job in all_jobs
+        if canonical_url(job.get("url", "")) not in dead_urls
+    ]
     dead = before - len(all_jobs)
     if dead:
         log(f"Liens morts : {dead} offre(s) retirée(s) (page 404/410)")
@@ -4092,48 +5741,12 @@ def run_profile(profile: str):
 
     raw = []
     health_alerts = []
-    active_scrapers = [
-        scraper for scraper in SCRAPERS
-        if ACTIVE_PROFILE == "systemes" or scraper not in SYSTEMES_ONLY_SCRAPERS
-    ]
-    active_playwright_scrapers = [
-        scraper for scraper in PLAYWRIGHT_SCRAPERS if scraper in active_scrapers
-    ]
-
-    def _run_one(scraper):
-        """Exécute un scraper isolément → [(nom, résultats)] ; n'émet jamais d'exception."""
-        name = scraper.__name__.replace("scrape_", "")
-        try:
-            results = scraper()
-            previous_max = health.get(name, {}).get("max", 0)
-            if (not results and previous_max > 0 and scraper not in PLAYWRIGHT_SCRAPERS
-                    and name not in HEALTH_SILENT_SOURCES):
-                log(f"↻ {name}: résultat vide inhabituel, seconde tentative")
-                results = scraper()
-            return [(name, results)]
-        except Exception as e:
-            log(f"⚠️  {scraper.__name__} a échoué : {e}")
-            return [(name, [])]
-
-    def _run_playwright_group():
-        """Sources Playwright en SÉQUENCE (l'API sync ne tolère pas le multi-thread)."""
-        out = []
-        for scraper in active_playwright_scrapers:
-            out.extend(_run_one(scraper))
-        return out
-
-    # Scrapers HTTP en parallèle (I/O-bound) + groupe Playwright dans une tâche unique
-    # lancée en parallèle. La politesse par domaine est garantie par _POLITE_LOCK.
-    http_scrapers = [s for s in active_scrapers if s not in PLAYWRIGHT_SCRAPERS]
-    collected = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(_run_one, s) for s in http_scrapers]
-        futures.append(pool.submit(_run_playwright_group))
-        for fut in as_completed(futures):
-            collected.extend(fut.result())
+    collected = collect_source_outcomes(profile)
 
     # Agrégation SÉQUENTIELLE dans le thread principal (pas de race sur raw/health).
-    for source_name, results in collected:
+    for outcome in collected:
+        source_name = outcome["name"]
+        results = outcome["results"]
         raw.extend(results)
         # Canari : compte de candidats bruts (clé = champ « source », appris des
         # résultats ou mémorisé d'un run précédent). raw=0 n'est retenu que pour une
@@ -4145,8 +5758,26 @@ def run_profile(profile: str):
         had_raw = health.get(source_name, {}).get("raw_max", 0) > 0
         raw_n = (_raw_counts.get(sf, 0)
                  if (sf and (sf in _raw_counts or had_raw)) else None)
+        status = outcome["status"]
+        if status not in ("error", "warning", "disabled"):
+            if results:
+                status = "ok"
+            elif raw_n is not None and raw_n > 0:
+                status = "filtered"
+            else:
+                status = "empty"
         health_alerts.extend(
-            update_health(source_name, len(results), health, raw=raw_n, source_field=sf))
+            update_health(
+                source_name,
+                len(results),
+                health,
+                raw=raw_n,
+                source_field=sf,
+                status=status,
+                duration_ms=outcome["duration_ms"],
+                error=outcome["error"],
+            )
+        )
 
     health_alerts.extend(update_query_coverage())
 
@@ -4167,21 +5798,21 @@ def run_profile(profile: str):
             if emp:
                 job["employer"] = emp
         finalize(job)
-        if passes_filters(job):
+        decision = classify_job(job)
+        if decision["destination"] == "main":
             job.pop("review_reason", None)
             job.pop("_review", None)
             seen.add(jid)
             job["_new"] = True
             new_jobs.append(job)
             continue
-        keep_for_review, reasons = review_candidate(job)
-        if keep_for_review:
+        if decision["destination"] == "review":
             job.pop("_review", None)
-            job["review_reason"] = "; ".join(reasons)
+            job["review_reason"] = decision["reason"]
             job["_new_review"] = True
             new_review_jobs.append(job)
         else:
-            record_rejection(filter_reason(job), job)
+            record_rejection(decision["reason"], job)
 
     # Fusion des doublons sur (archive + nouvelles offres). On traite les offres
     # à employeur CONNU d'abord (canoniques, absorbent les variantes sans
@@ -4216,6 +5847,7 @@ def run_profile(profile: str):
     save_review_jobs(review_jobs)
     save_health(health)
     save_rejection_report()
+    _save_detail_cache()
     generate_html(new_jobs, all_jobs, review_jobs)
     generate_rss(all_jobs)
     send_alert(new_jobs, health_alerts)
@@ -4248,8 +5880,7 @@ def parse_args(argv=None):
     return profile
 
 
-def main(argv=None):
-    profile = parse_args(argv)
+def _main_unlocked(profile: str):
     if profile == "all":
         for name in PROFILES:
             run_profile(name)
@@ -4257,6 +5888,16 @@ def main(argv=None):
         return
     run_profile(profile)
     generate_portal_index()
+
+
+def main(argv=None):
+    profile = parse_args(argv)
+    try:
+        with scraper_process_lock(), shared_run_cache():
+            return _main_unlocked(profile)
+    except ScraperAlreadyRunning as exc:
+        print(str(exc))
+        return 0
 
 
 if __name__ == "__main__":
