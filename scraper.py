@@ -1096,7 +1096,10 @@ def is_fle(title: str, description: str = "") -> bool:
     """Vrai si un terme FLE figure dans le titre ou la description."""
     return term_in(normalize(title + " " + description), _FLE_RE)
 
-# Détection de langue — mots exclusivement allemands (normalize() enlève les accents)
+# Détection de langue — normalize() enlève les accents, donc « für » devient « fur ».
+# Les titres de métiers sont souvent en anglais même quand toute la fiche est en
+# allemand. On combine donc des marqueurs métier forts et des mots fonctionnels,
+# avec des contre-signaux français pour conserver les annonces bilingues.
 _DE_STRONG = {
     "pflegefachfrau", "pflegefachmann", "pflegefachperson",
     "nachtwache", "ausbildung", "verantwortung", "bewerber",
@@ -1104,10 +1107,25 @@ _DE_STRONG = {
     "dienstleistung", "anforderungen",
     "datenbank", "uberwachung", "teamleiter", "infrastruktur",
     "optimierung", "plattformen", "befristet", "stellenantritt", "arbeitspensum",
+    "aufgabenbereich", "berufserfahrung", "bewerbung", "deutschkenntnisse",
+    "fachkenntnisse", "geschaftsleitung", "kenntnisse", "mitarbeiter",
+    "sachbearbeiter", "tatigkeit", "voraussetzungen", "weiterentwicklung",
 }
 _DE_COMMON = {
-    "und", "fur", "nach", "beim", "stelle", "kenntnisse", "haben", "sein",
-    "mit", "als", "der", "die", "das", "von", "zur", "zum", "auf",
+    "und", "fur", "oder", "nach", "beim", "mit", "als", "der", "die",
+    "das", "den", "dem", "von", "zur", "zum", "auf", "aus",
+    "ein", "eine", "einer", "einen", "einem", "im", "am", "bei", "wir",
+    "sie", "ihre", "ihren", "ihrer", "ihrem", "ihr", "du", "dein",
+    "deine", "dich", "unser", "unsere", "sich", "auch", "nicht", "sowie",
+    "sind", "ist", "haben", "wird", "werden", "bieten", "bringen",
+    "arbeit", "aufgaben", "stelle",
+}
+_FR_COMMON = {
+    "afin", "ainsi", "avec", "aux", "candidature", "ce", "ces", "cette",
+    "competences", "dans", "dont", "equipe", "etre", "francais", "missions",
+    "notre", "nous", "offrons", "pour", "poste", "profil", "que", "qui",
+    "recherche", "recherchons", "responsabilites", "travail", "une", "votre",
+    "vos", "vous",
 }
 
 
@@ -1296,16 +1314,35 @@ def strict_title_match(title: str) -> bool:
     return False
 
 
-def is_french_text(title: str) -> bool:
-    """Retourne False si le titre est clairement en allemand.
+def _language_signal_counts(text: str) -> tuple[int, int, int]:
+    """Compte les marqueurs allemands forts/usuels et les marqueurs français."""
+    words = re.findall(r"\b[^\W\d_]+\b", normalize(text), flags=re.UNICODE)
+    de_strong = sum(word in _DE_STRONG for word in words)
+    de_common = sum(word in _DE_COMMON for word in words)
+    fr_common = sum(word in _FR_COMMON for word in words)
+    return de_strong, de_common, fr_common
 
-    Politique tolérante : en cas de doute on garde l'offre plutôt que de la rater.
+
+def is_french_text(title: str, description: str = "") -> bool:
+    """Retourne False si le titre ou la fiche est clairement en allemand.
+
+    Un titre anglais seul reste indéterminé. Une vraie version française ou
+    bilingue est conservée ; une description dominée par l'allemand est rejetée.
     """
-    words = set(normalize(title).split())
-    if words & _DE_STRONG:
+    title_strong, title_de, title_fr = _language_signal_counts(title)
+    if title_strong and not title_fr:
         return False
-    if len(words & _DE_COMMON) >= 2:
+    if title_de >= 2 and title_de > title_fr:
         return False
+    if description:
+        desc_strong, desc_de, desc_fr = _language_signal_counts(description[:5000])
+        clearly_german = (
+            desc_de >= 6
+            and desc_de >= 2 * max(desc_fr, 1)
+            and (desc_strong >= 1 or desc_de >= 10)
+        )
+        if clearly_german:
+            return False
     return True
 
 
@@ -2004,7 +2041,8 @@ def passes_filters(job: dict) -> bool:
     une décision uniforme quel que soit le scraper d'origine.
     """
     title = job.get("title", "")
-    if not is_french_text(title) or not strict_title_match(title):
+    description = job.get("description", "")
+    if not is_french_text(title, description) or not strict_title_match(title):
         return False
     # Un lieu explicite hors zone dans le titre, le champ lieu ou un
     # « Duty Station » structuré est bloquant, y compris pour l'archive.
@@ -2567,7 +2605,7 @@ def filter_reason(job: dict) -> str:
     title = job.get("title", "")
     description = job.get("description", "")
     title_norm = normalize(title)
-    if not is_french_text(title):
+    if not is_french_text(title, description):
         return "langue_non_prise_en_charge"
     if term_in(title_norm, _TITLE_EXCLUDE_RE) or term_in(title_norm, _EXCLUDE_RE):
         return "metier_exclu_dans_titre"
@@ -2587,7 +2625,7 @@ def review_candidate(job: dict) -> tuple[bool, list]:
     title = job.get("title", "")
     description = job.get("description", "")
     title_norm = normalize(title)
-    if not is_french_text(title):
+    if not is_french_text(title, description):
         return False, []
     if term_in(title_norm, _TITLE_EXCLUDE_RE) or term_in(title_norm, _EXCLUDE_RE):
         return False, []
@@ -2778,7 +2816,7 @@ def consider(title: str, url: str, base_fields: dict, jobs: list, seen_urls: set
         "description": fields.pop("description", ""),
         **fields,
     }
-    if not is_french_text(title):
+    if not is_french_text(title, seed_job.get("description", "")):
         record_rejection("langue_non_prise_en_charge", seed_job)
         return
     title_norm = normalize(title)
@@ -5667,7 +5705,10 @@ def run_profile(profile: str):
     all_jobs, seen = expire_old_jobs(all_jobs, seen)
     review_jobs, _ = expire_old_jobs(review_jobs, set())
     before = len(all_jobs)
-    all_jobs = [j for j in all_jobs if is_french_text(j.get("title", ""))]
+    all_jobs = [
+        j for j in all_jobs
+        if is_french_text(j.get("title", ""), j.get("description", ""))
+    ]
     removed = before - len(all_jobs)
     if removed:
         log(f"Nettoyage : {removed} offre(s) non-francophone(s) retirée(s) de l'archive")

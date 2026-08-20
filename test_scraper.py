@@ -301,6 +301,39 @@ class RelevanceRegressionTests(unittest.TestCase):
         )
         self.assertFalse(scraper.is_french_text("Senior Site Reliability Engineer Hosting Plattformen"))
 
+    def test_german_description_is_rejected_even_with_english_title(self):
+        german_description = (
+            "Als Teil unseres Teams gestalten Sie die globale Kommunikation. "
+            "Ihre Aufgaben umfassen die Konzeption und Umsetzung verschiedener "
+            "Massnahmen. Sie arbeiten mit unseren Fachpersonen und bringen "
+            "mehrjahrige Berufserfahrung sowie sehr gute Deutschkenntnisse mit."
+        )
+        for profile, title in (
+            ("lettres", "Product Communication Manager (all genders)"),
+            ("systemes", "Senior IT System Engineer"),
+            ("comptabilite", "Senior Accountant"),
+        ):
+            with self.subTest(profile=profile):
+                self.assertEqual(
+                    classify(profile, title, german_description),
+                    "reject",
+                )
+
+    def test_french_and_bilingual_offers_are_kept(self):
+        french_description = (
+            "Au sein de notre équipe, vous assurez les missions de communication. "
+            "Votre profil et vos compétences correspondent au poste. "
+            "La maîtrise de l'allemand constitue un atout."
+        )
+        self.assertEqual(
+            classify("lettres", "Communications Manager", french_description),
+            "main",
+        )
+        self.assertTrue(scraper.is_french_text(
+            "Un chargé de communication *** Kommunikationsbeauftragter oder "
+            "Kommunikationsbeauftragte"
+        ))
+
 
 class LinkedInAlertTests(unittest.TestCase):
     def test_extracts_job_from_email_without_tracking_parameters(self):
