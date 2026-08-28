@@ -14,9 +14,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  rechercher-et-publier:
+  tester:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Installer les dépendances
+        run: python -m pip install -r requirements.txt
+      - name: Tester le filtrage et les parseurs
+        run: python -m unittest -v
+
+  rechercher:
+    needs: tester
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        profile: [lettres, comptabilite, systemes]
     env:
       ADZUNA_ID: ${{ secrets.ADZUNA_ID }}
       ADZUNA_KEY: ${{ secrets.ADZUNA_KEY }}
@@ -30,62 +52,76 @@ jobs:
       LINKEDIN_IMAP_PASS: ${{ secrets.LINKEDIN_IMAP_PASS }}
       LINKEDIN_IMAP_FOLDER: ${{ secrets.LINKEDIN_IMAP_FOLDER }}
       LINKEDIN_ALERT_DEFAULT_LOCATION: ${{ secrets.LINKEDIN_ALERT_DEFAULT_LOCATION }}
-
     steps:
       - name: Récupérer le dépôt
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
-      - name: Installer les dépendances
+      - name: Installer les dépendances et Chromium
         run: |
-          python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-
-      - name: Restaurer l'historique de recherche
+      - name: Restaurer l'historique du profil
         uses: actions/cache/restore@v4
         with:
-          path: data
-          key: find-job-data-${{ github.run_id }}
+          path: data/${{ matrix.profile }}
+          key: find-job-data-${{ matrix.profile }}-${{ github.run_id }}
           restore-keys: |
-            find-job-data-
-
-      - name: Tester le filtrage
-        run: python -m unittest -v
-
+            find-job-data-${{ matrix.profile }}-
       - name: Rechercher les offres
-        run: python scraper.py --profile all
-
-      - name: Conserver l'historique de recherche
-        if: always()
+        run: python scraper.py --profile ${{ matrix.profile }}
+      - name: Conserver l'historique du profil
+        if: success()
         uses: actions/cache/save@v4
         with:
-          path: data
-          key: find-job-data-${{ github.run_id }}
-
-      - name: Sauvegarder un état récupérable
-        if: always()
+          path: data/${{ matrix.profile }}
+          key: find-job-data-${{ matrix.profile }}-${{ github.run_id }}
+      - name: Préparer la publication et l'état récupérable
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: find-job-state-${{ github.run_id }}
+          name: etat-${{ matrix.profile }}
           path: |
-            data/*/seen_jobs.json
-            data/*/all_jobs.json
-            data/*/review_jobs.json
-            data/*/health.json
-            data/*/query_coverage.json
-            data/*/rejections.json
-            data/*/detail_cache.json
-          if-no-files-found: warn
+            data/${{ matrix.profile }}/seen_jobs.json
+            data/${{ matrix.profile }}/all_jobs.json
+            data/${{ matrix.profile }}/review_jobs.json
+            data/${{ matrix.profile }}/health.json
+            data/${{ matrix.profile }}/query_coverage.json
+            data/${{ matrix.profile }}/rejections.json
+            data/${{ matrix.profile }}/detail_cache.json
+            docs/${{ matrix.profile }}
+          if-no-files-found: error
           retention-days: 14
+      - name: Résumé du profil
+        if: always()
+        run: echo "Profil ${{ matrix.profile }} — état ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
 
+  publier:
+    needs: rechercher
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Installer les dépendances
+        run: python -m pip install -r requirements.txt
+      - name: Réunir les trois profils
+        uses: actions/download-artifact@v4
+        with:
+          pattern: etat-*
+          merge-multiple: true
+      - name: Régénérer le portail et le diagnostic global
+        run: python -c "import scraper; scraper.generate_portal_index()"
       - name: Publier les rapports GitHub Pages
         run: |
           git config user.name "github-actions[bot]"

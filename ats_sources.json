@@ -21,6 +21,30 @@
       "source": "careers.sqli.com",
       "company_id": "SQLI1",
       "profiles": ["systemes"]
+    },
+    {
+      "type": "smartrecruiters",
+      "name": "Hôpitaux universitaires de Genève",
+      "source": "careers.hug.ch",
+      "company_id": "HUG"
+    },
+    {
+      "type": "successfactors",
+      "name": "Union internationale des télécommunications",
+      "source": "jobs.itu.int",
+      "list_urls": [
+        "https://jobs.itu.int/go/View-all-categories/8942455/?q=&sortColumn=referencedate&sortDirection=desc",
+        "https://jobs.itu.int/go/View-all-categories/8942455/25/?q=&sortColumn=referencedate&sortDirection=desc"
+      ]
+    },
+    {
+      "type": "successfactors",
+      "name": "Organisation internationale du Travail",
+      "source": "jobs.ilo.org",
+      "list_urls": [
+        "https://jobs.ilo.org/go/All-Jobs/2842101/",
+        "https://jobs.ilo.org/go/All-Jobs/2842101/25/"
+      ]
     }
   ]
 }

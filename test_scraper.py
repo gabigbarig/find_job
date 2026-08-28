@@ -45,7 +45,6 @@ class RelevanceRegressionTests(unittest.TestCase):
             "Trust Administrator",
             "UN TECHNICIEN METHODE ET INDUSTRIALISATION",
             "Software Platform Engineer",
-            "Embedded Linux Development Engineer",
         ]
         for title in rejected:
             with self.subTest(title=title):
@@ -62,6 +61,19 @@ class RelevanceRegressionTests(unittest.TestCase):
         for title in accepted:
             with self.subTest(title=title):
                 self.assertEqual(classify("systemes", title), "main")
+
+    def test_systemes_routes_adjacent_roles_without_false_main(self):
+        expected = {
+            "Spécialiste support Windows N2/N3": "main",
+            "Cloud Operations Specialist": "main",
+            "Senior DevOps Engineer - Kubernetes": "main",
+            "Microsoft 365 / Intune Administrator": "main",
+            "Data Platform Engineer": "review",
+            "Embedded Linux Development Engineer": "review",
+        }
+        for title, destination in expected.items():
+            with self.subTest(title=title):
+                self.assertEqual(classify("systemes", title), destination)
 
     def test_lettres_rejects_other_subjects_and_generic_admin(self):
         rejected = [
@@ -93,6 +105,19 @@ class RelevanceRegressionTests(unittest.TestCase):
         for title in accepted:
             with self.subTest(title=title):
                 self.assertEqual(classify("lettres", title), "main")
+
+    def test_lettres_covers_editorial_and_public_relations_contextually(self):
+        expected = {
+            "Responsable relations publiques": "main",
+            "Public Relations Specialist": "main",
+            "Responsable éditorial": "main",
+            "Content Specialist": "reject",
+            "Content Specialist – Publications": "review",
+            "Professeur-e d’anglais (littérature anglaise)": "reject",
+        }
+        for title, destination in expected.items():
+            with self.subTest(title=title):
+                self.assertEqual(classify("lettres", title), destination)
 
     def test_description_only_requires_two_strong_anchors(self):
         self.assertEqual(
@@ -279,6 +304,24 @@ class RelevanceRegressionTests(unittest.TestCase):
         self.assertEqual(classify("comptabilite", "Regional Financial Controller"), "main")
         self.assertEqual(classify("comptabilite", "Directeur Administratif et Financier"), "main")
 
+    def test_comptabilite_routes_swiss_fiduciary_terms_to_review(self):
+        for title in (
+            "Responsable de mandats", "Gestionnaire de mandats fiduciaires",
+            "Senior Tax Consultant", "Finance Manager", "Assistant Family Office",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(classify("comptabilite", title), "review")
+        self.assertEqual(
+            classify("comptabilite", "Application Consultant Payroll"), "reject"
+        )
+
+    def test_min_score_is_an_effective_main_gate(self):
+        with patch.dict(scraper.os.environ, {"MIN_SCORE": "3"}):
+            self.assertEqual(
+                classify("lettres", "Responsable relations publiques"), "review"
+            )
+        scraper.configure_profile("lettres")
+
     def test_description_noise_is_removed(self):
         polluted = (
             "Régions Choisissez une région Plus d'offres d'emploi: chauffeur "
@@ -434,6 +477,25 @@ class DirectATSTests(unittest.TestCase):
         ])
         self.assertEqual(jobs[0]["external_id"], "1")
 
+    @patch.object(scraper, "fetch")
+    def test_successfactors_adapter_reads_server_rendered_cards(self, fetch):
+        fetch.return_value = scraper.BeautifulSoup(
+            """
+            <article><a href="/job/Geneva/Linux-Administrator/42/">
+            Linux Administrator</a><p>Location: Geneva, Switzerland</p></article>
+            <article><a href="/job/Zurich/System-Administrator/43/">
+            System Administrator</a><p>Location: Zürich, Switzerland</p></article>
+            """, "lxml",
+        )
+        jobs = []
+        scraper._scrape_successfactors_source({
+            "name": "Organisation Test", "source": "jobs.test",
+            "list_url": "https://jobs.test/go/All-Jobs/1/",
+        }, jobs, set())
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["location"], "Geneva, Switzerland")
+        self.assertEqual(jobs[0]["company"], "Organisation Test")
+
 
 class ParserFixtureTests(unittest.TestCase):
     def test_jobscout24_fixture(self):
@@ -445,6 +507,19 @@ class ParserFixtureTests(unittest.TestCase):
         self.assertEqual(len(offers), 1)
         self.assertEqual(offers[0]["title"], "Administrateur Système Linux")
         self.assertEqual(offers[0]["location"], "Genève")
+
+    def test_jobscout24_never_invents_geneva_for_an_unknown_place(self):
+        html = """
+        <article><a class="job-title" href="/fr/job/42">Administrateur Linux</a>
+        <p class="job-location">Schwerzenbach</p></article>
+        """
+        offers = scraper._parse_jobscout24_page(
+            html, "https://www.jobscout24.ch", fallback_location="Genève"
+        )
+        self.assertEqual(offers[0]["location"], "Schwerzenbach")
+        self.assertEqual(
+            scraper.structured_geography(offers[0]["location"])["status"], "outside"
+        )
 
     def test_jobup_fixture_and_zone_filter(self):
         offers = scraper._parse_jobup_page(
@@ -493,6 +568,21 @@ class ParserFixtureTests(unittest.TestCase):
             scraper._company_from_card(card), "Organisation Exemple"
         )
 
+    def test_target_zone_never_leaks_between_neighboring_cards(self):
+        soup = scraper.BeautifulSoup(
+            """
+            <main>
+              <article><a id="local">Administrateur Linux</a><p>Genève</p></article>
+              <article><a id="far">Administrateur Linux</a><p>Zürich</p></article>
+            </main>
+            """,
+            "lxml",
+        )
+        local_card, _ = scraper._job_card_in_target_zone(soup.select_one("#local"))
+        far_card, _ = scraper._job_card_in_target_zone(soup.select_one("#far"))
+        self.assertIsNotNone(local_card)
+        self.assertIsNone(far_card)
+
     def test_wipo_unified_listing_fixture(self):
         offers = scraper._parse_wipo_listing(
             fixture_text("wipo.html"),
@@ -503,6 +593,32 @@ class ParserFixtureTests(unittest.TestCase):
             offers[0]["title"], "CRM and Business Process Assistant"
         )
         self.assertIn("job=26203-TA", offers[0]["url"])
+        self.assertEqual(offers[0]["location"], "Genève")
+
+    def test_letemps_current_uuid_listing_fixture(self):
+        offers = scraper._parse_letemps_listing(
+            fixture_text("letemps.html"), "https://www.letemps.ch/emploi"
+        )
+        self.assertEqual(len(offers), 2)
+        self.assertEqual(offers[0]["title"], "Responsable éditorial·e")
+        self.assertEqual(offers[0]["location"], "Genève")
+        self.assertEqual(offers[0]["company"], "Organisation Exemple")
+
+    def test_un_structured_feed_fixture(self):
+        offers = scraper._parse_un_job_feed(
+            fixture_text("un_feed.html"), "https://careers.un.org/jobfeed"
+        )
+        self.assertEqual(len(offers), 2)
+        self.assertEqual(offers[0]["external_id"], "281829")
+        self.assertEqual(offers[0]["location"], "GENEVA")
+        self.assertEqual(offers[0]["company"], "United Nations Office at Geneva")
+
+    def test_institutional_heading_cards_fixture(self):
+        offers = scraper._parse_heading_job_cards(
+            fixture_text("institution_jobs.html"), "https://www.ecolint.ch/fr/emploi"
+        )
+        self.assertEqual(len(offers), 2)
+        self.assertEqual(offers[0]["title"], "Responsable des relations publiques")
         self.assertEqual(offers[0]["location"], "Genève")
 
     def test_cagi_listing_fixture_ignores_categories_and_pagination(self):
@@ -856,6 +972,50 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(
             health["source_optionnelle"]["last_status"], "disabled"
         )
+
+    def test_health_alerts_for_a_source_that_has_always_been_raw_empty(self):
+        health = {}
+        alerts = []
+        for _ in range(5):
+            alerts = scraper.update_health(
+                "source_muette", 0, health, raw=0,
+                source_field="muette.example", status="empty",
+            )
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("jamais aucun résultat", alerts[0])
+        entry = health["source_muette"]
+        self.assertIn("last_run_at", entry)
+        self.assertNotIn("last_healthy_at", entry)
+        self.assertNotIn("last_success_at", entry)
+
+    def test_health_stage_metrics_separate_main_review_and_unique(self):
+        scraper.configure_profile("lettres")
+        main = scraper.finalize({
+            "title": "Responsable éditorial", "location": "Genève",
+            "url": "https://example.test/1", "source": "source.example",
+        })
+        review = scraper.finalize({
+            "title": "Content Specialist – Publications", "location": "Genève",
+            "url": "https://example.test/2", "source": "source.example",
+        })
+        health = {"source": {"source_field": "source.example"}}
+        scraper.update_health_stage_metrics(health, [main, review, dict(main)])
+        self.assertEqual(health["source"]["main_last"], 2)
+        self.assertEqual(health["source"]["review_last"], 1)
+        self.assertEqual(health["source"]["unique_last"], 2)
+
+    def test_status_page_exposes_publication_freshness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            published_at = scraper.datetime(
+                2026, 8, 28, 12, 30, tzinfo=scraper.LOCAL_TIMEZONE
+            )
+            with patch.object(scraper, "DATA_ROOT", root / "data"), \
+                    patch.object(scraper, "DOCS_ROOT", root / "docs"):
+                scraper.generate_status_page(published_at)
+            html = (root / "docs" / "status.html").read_text(encoding="utf-8")
+        self.assertIn('data-last-published="2026-08-28T12:30:00+02:00"', html)
+        self.assertIn("dernière publication remonte à plus de 36 heures", html)
 
     def test_detail_cache_survives_a_new_run(self):
         with tempfile.TemporaryDirectory() as tmp:

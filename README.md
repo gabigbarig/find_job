@@ -22,11 +22,12 @@ Profils disponibles :
 ```
 
 Sources supplémentaires : ReliefWeb, CAGI et cinfoPoste pour la Genève
-internationale ; CERN, CICR, OMPI, SIG, TPG, ONU Genève et OMC sont aussi lus
-par les profils généralistes puis filtrés par métier. Sources réservées au
-profil `systemes` : SwissDevJobs, itjobs.ch, ITBoard et Job-Room. Job-Room,
-TPG et ONU Genève nécessitent Chromium/Playwright ; CAGI l'utilise seulement
-en repli si son listing HTML n'est pas accessible directement.
+internationale ; CERN, CICR, OMPI, SIG, TPG, ONU, OMC, OMS, OIT, UIT, UNICEF,
+HUG, Ville de Nyon, Ecolint et Pictet sont aussi lus puis filtrés par métier.
+Sources réservées au profil `systemes` : SwissDevJobs, itjobs.ch, ITBoard et
+Job-Room. Job-Room, TPG, Pictet et certaines pages institutionnelles utilisent
+Chromium/Playwright lorsque leur HTML direct ne suffit pas. CAGI l'utilise
+seulement en repli si son listing HTML n'est pas accessible directement.
 
 Ubuntu 26.04 nécessite Playwright 1.61 ou plus récent. Mettre à niveau la
 bibliothèque, puis installer une fois son navigateur compatible :
@@ -93,11 +94,12 @@ mot de passe doit être un mot de passe d'application, pas celui du compte.
 ## Automatisation GitHub
 
 Le workflow `.github/workflows/recherche-emploi.yml` lance les trois profils à
-08:17, 14:17 et 20:17, heure de Genève, puis publie les changements de `docs/`.
-Il peut aussi être lancé manuellement depuis l'onglet **Actions**. L'historique
-contenu dans `data/` est conservé dans un cache GitHub sans être ajouté au dépôt.
-Un instantané JSON récupérable est également gardé 14 jours dans les artefacts
-de chaque exécution.
+08:17, 14:17 et 20:17, heure de Genève. Ils s'exécutent en parallèle avec un
+cache d'historique distinct, puis un quatrième job fusionne et publie les trois
+rapports. Il peut aussi être lancé manuellement depuis l'onglet **Actions**.
+L'historique contenu dans `data/` reste dans les caches GitHub sans être ajouté
+au dépôt. Un instantané récupérable est également gardé 14 jours dans les
+artefacts de chaque exécution.
 
 Dans **Settings → Secrets and variables → Actions**, ajouter si nécessaire :
 
@@ -114,6 +116,9 @@ filtres et tri. Les favoris, candidatures envoyées et offres masquées sont
 conservés dans le navigateur ; l'export/import permet de transférer ce suivi.
 Les correspondances locales trop faibles pour la sélection principale sont
 conservées dans « Offres à vérifier ». La page `docs/status.html` expose la
-couverture des sources, leur état, leur durée, leur dernier succès, les requêtes
-muettes et les motifs de rejet. Les principaux sélecteurs fragiles sont vérifiés
-hors réseau à partir des fixtures de `tests/fixtures/`.
+couverture des sources, leur état, leur durée, leur dernière exécution réellement
+saine et leur production à chaque étape (brut, unique, sélection, revue). Elle
+avertit aussi si la publication devient ancienne et affiche les requêtes muettes
+et les motifs de rejet. Les portails ATS configurés sont suivis individuellement
+afin qu'une panne ne soit pas masquée par les autres. Les principaux sélecteurs
+fragiles sont vérifiés hors réseau à partir des fixtures de `tests/fixtures/`.
