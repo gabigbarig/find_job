@@ -80,7 +80,7 @@ jobs:
           path: data/${{ matrix.profile }}
           key: find-job-data-${{ matrix.profile }}-${{ github.run_id }}
       - name: Préparer la publication et l'état récupérable
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: etat-${{ matrix.profile }}
@@ -92,15 +92,17 @@ jobs:
             data/${{ matrix.profile }}/query_coverage.json
             data/${{ matrix.profile }}/rejections.json
             data/${{ matrix.profile }}/detail_cache.json
+            data/${{ matrix.profile }}/scraper.log
             docs/${{ matrix.profile }}
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
       - name: Résumé du profil
         if: always()
         run: echo "Profil ${{ matrix.profile }} — état ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
 
   publier:
-    needs: rechercher
+    needs: [tester, rechercher]
+    if: always() && !cancelled() && needs.tester.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -117,6 +119,7 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Réunir les trois profils
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: etat-*
           merge-multiple: true
@@ -131,5 +134,9 @@ jobs:
             echo "Aucune modification à publier."
           else
             git commit -m "Mise à jour automatique des offres $(date '+%Y-%m-%d %H:%M')"
-            git push
+            if ! git push; then
+              echo "Le dépôt distant a changé : rebase puis nouvel essai."
+              git pull --rebase -X theirs origin main
+              git push
+            fi
           fi

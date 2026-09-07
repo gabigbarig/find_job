@@ -96,10 +96,14 @@ mot de passe doit être un mot de passe d'application, pas celui du compte.
 Le workflow `.github/workflows/recherche-emploi.yml` lance les trois profils à
 08:17, 14:17 et 20:17, heure de Genève. Ils s'exécutent en parallèle avec un
 cache d'historique distinct, puis un quatrième job fusionne et publie les trois
-rapports. Il peut aussi être lancé manuellement depuis l'onglet **Actions**.
+rapports. Si un profil échoue, les profils réussis sont tout de même publiés et
+le dernier rapport valide du profil en échec est conservé. Il peut aussi être
+lancé manuellement depuis l'onglet **Actions**.
 L'historique contenu dans `data/` reste dans les caches GitHub sans être ajouté
 au dépôt. Un instantané récupérable est également gardé 14 jours dans les
-artefacts de chaque exécution.
+artefacts de chaque exécution. Le workflow `surveiller-publication.yml` vérifie
+toutes les six heures que la publication et chacun des profils ont moins de
+36 heures ; son échec rend immédiatement le retard visible dans GitHub Actions.
 
 Dans **Settings → Secrets and variables → Actions**, ajouter si nécessaire :
 
@@ -112,7 +116,9 @@ Les identifiants sont tous facultatifs : les sources concernées sont simplement
 ignorées quand leurs secrets ne sont pas configurés.
 
 Les rapports GitHub Pages partagent une interface responsive avec recherche,
-filtres et tri. Les favoris, candidatures envoyées et offres masquées sont
+filtres et tri. Le classement distingue le « Cœur de cible » des métiers
+connexes, puis tient compte du score métier et de la qualité de la fiche, sans
+retirer les offres connexes. Les favoris, candidatures envoyées et offres masquées sont
 conservés dans le navigateur ; l'export/import permet de transférer ce suivi.
 Les correspondances locales trop faibles pour la sélection principale sont
 conservées dans « Offres à vérifier ». La page `docs/status.html` expose la

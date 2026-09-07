@@ -1,3 +1,23 @@
 {
-  "last_published_at": "2026-09-07T14:34:12.842010+02:00"
+  "schema_version": 2,
+  "generated_at": "2026-09-07T17:16:41.237594+02:00",
+  "last_published_at": "2026-09-07T17:16:41.237594+02:00",
+  "oldest_profile_at": "2026-08-28T12:57:19.523187+02:00",
+  "profiles": {
+    "lettres": {
+      "last_run_at": "2026-08-28T12:57:19.523187+02:00",
+      "total": 12,
+      "review_count": 7
+    },
+    "comptabilite": {
+      "last_run_at": "2026-08-28T12:59:59.372584+02:00",
+      "total": 126,
+      "review_count": 14
+    },
+    "systemes": {
+      "last_run_at": "2026-08-28T13:03:36.222279+02:00",
+      "total": 45,
+      "review_count": 15
+    }
+  }
 }

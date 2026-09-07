@@ -111,6 +111,9 @@ class Job(TypedDict, total=False):
     posting_id: str
     taux: str
     score: int
+    rank_score: int
+    fit_tier: Literal["core", "adjacent"]
+    alternate_sources: list[str]
     review_reason: str
 
 
@@ -384,11 +387,11 @@ def _atomic_write_text(path: Path, text: str, keep_backup: bool = False):
         temp.unlink(missing_ok=True)
 
 
-def _atomic_write_json(path: Path, value):
+def _atomic_write_json(path: Path, value, keep_backup: bool = True):
     _atomic_write_text(
         path,
         json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-        keep_backup=True,
+        keep_backup=keep_backup,
     )
 
 
@@ -559,6 +562,8 @@ LETTRES_TITLE_EXCLUDE_KEYWORDS = [
     "creative content specialist", "training content specialist", "retail watchmaking",
     "watchmaking training", "video editor", "marketing video editor",
     "ai marketing", "records manager",
+    # Formations académiques sans contrat de travail.
+    "programme doctoral", "doctoral programme", "phd programme",
 ]
 
 COMPTABILITE_KEYWORDS = [
@@ -752,6 +757,10 @@ SYSTEMES_TITLE_EXCLUDE_KEYWORDS = [
     "gestionnaire administratif", "trust administrator", "gestionnaire de trust",
     "ERP technical", "D365", "NetSuite", "payroll systems",
     "infrastructure télécom", "telecom infrastructure",
+    # Le mot « system » désigne ici le produit ou le référentiel, pas un poste
+    # d'administration/infrastructure informatique.
+    "fpga system engineer", "quantum microscopy", "safety standards",
+    "java platform engineer",
 ]
 
 SYSTEMES_REVIEW_ONLY = [
@@ -895,6 +904,29 @@ PROFILES = {
         ],
         "min_score": 2,
     },
+}
+PROFILE_CORE_TITLE_TERMS = {
+    "lettres": [
+        "français", "lettres", "littérature", "enseignant", "professeur",
+        "rédacteur", "rédactrice", "éditeur", "éditrice", "éditorial",
+        "correcteur", "correctrice", "proofreader", "bibliothécaire",
+        "documentaliste", "archiviste", "libraire", "traducteur",
+        "traductrice", "médiation culturelle", "information documentaire",
+    ],
+    "comptabilite": [
+        "comptable", "comptabilité", "accountant", "accounting",
+        "bookkeeper", "accounts payable", "accounts receivable",
+        "general ledger", "aide-comptable", "assistant comptable",
+        "fiduciaire", "facturation", "billing",
+    ],
+    "systemes": [
+        "administrateur système", "administrateur systèmes",
+        "system administrator", "systems administrator", "system engineer",
+        "systems engineer", "ingénieur système", "ingénieur systèmes",
+        "infrastructure engineer", "ingénieur infrastructure", "sysadmin",
+        "linux", "unix", "windows server", "red hat", "rhel", "vmware",
+        "openshift", "kubernetes", "ansible", "openstack",
+    ],
 }
 ACTIVE_PROFILE = DEFAULT_PROFILE
 ACTIVE_PROFILE_CONFIG = PROFILES[DEFAULT_PROFILE]
@@ -1055,6 +1087,7 @@ _TEACHING_RE = _compile_terms(TEACHING_TERMS)
 _SUBJECTS_RE = _compile_terms(LETTRES_SUBJECTS)
 _REVIEW_RE = _compile_terms(PROFILES[DEFAULT_PROFILE].get("review_signals", []))
 _DESC_ANCHOR_RE = _compile_terms(PROFILES[DEFAULT_PROFILE].get("description_anchors", []))
+_CORE_TITLE_RE = _compile_terms(PROFILE_CORE_TITLE_TERMS[DEFAULT_PROFILE])
 
 
 def profile_url(profile: str) -> str:
@@ -1069,7 +1102,7 @@ def configure_profile(profile: str):
     global LOG_FILE, HEALTH_FILE, RSS_FILE, REVIEW_FILE, REJECTIONS_FILE, COVERAGE_FILE
     global DETAIL_CACHE_FILE
     global _KW_RE, _EXCLUDE_RE, _TITLE_EXCLUDE_RE, _REVIEW_ONLY_RE
-    global _SUBJECTS_RE, _REVIEW_RE
+    global _SUBJECTS_RE, _REVIEW_RE, _CORE_TITLE_RE
     global _DESC_ANCHOR_RE
 
     if profile not in PROFILES:
@@ -1088,6 +1121,7 @@ def configure_profile(profile: str):
     _SUBJECTS_RE = _compile_terms(cfg.get("subjects", []))
     _REVIEW_RE = _compile_terms(cfg.get("review_signals", []))
     _DESC_ANCHOR_RE = _compile_terms(cfg.get("description_anchors", []))
+    _CORE_TITLE_RE = _compile_terms(PROFILE_CORE_TITLE_TERMS[profile])
 
     DATA_DIR = DATA_ROOT / profile
     DOCS_DIR = DOCS_ROOT / profile
@@ -1167,6 +1201,7 @@ _DE_STRONG = {
     "aufgabenbereich", "berufserfahrung", "bewerbung", "deutschkenntnisse",
     "fachkenntnisse", "geschaftsleitung", "kenntnisse", "mitarbeiter",
     "sachbearbeiter", "tatigkeit", "voraussetzungen", "weiterentwicklung",
+    "techniker", "bereich", "betrieb", "betreuung", "wartung",
 }
 _DE_COMMON = {
     "und", "fur", "oder", "nach", "beim", "mit", "als", "der", "die",
@@ -1313,6 +1348,27 @@ def relevance_score(title: str, description: str = "") -> int:
     return score
 
 
+AGGREGATOR_SOURCES = {
+    "adzuna (indeed+)", "jobup.ch", "jobscout24.ch", "jobs.ch", "indeed ch",
+}
+
+
+def job_fit_tier(job: dict) -> str:
+    """Sépare le métier recherché de ses débouchés connexes, sans filtrer."""
+    return "core" if term_in(normalize(job.get("title", "")), _CORE_TITLE_RE) else "adjacent"
+
+
+def ranking_score(job: dict) -> int:
+    """Priorité lisible : pertinence métier + qualité de la fiche et de la source."""
+    score = int(job.get("score", 0) or 0)
+    score += 4 if job_fit_tier(job) == "core" else 0
+    score += 1 if job_employer(job) else 0
+    score += 1 if len(str(job.get("description", "") or "").strip()) >= 80 else 0
+    source = normalize(job.get("source", ""))
+    score += 1 if source and source not in AGGREGATOR_SOURCES else 0
+    return score
+
+
 def is_relevant(title: str, description: str = "") -> bool:
     title_norm = normalize(title)
     description_norm = normalize(description)
@@ -1452,6 +1508,7 @@ def expire_old_jobs(all_jobs: list, seen: set) -> tuple:
 # --- Cache des parseurs robots.txt par domaine ---
 _ROBOTS_CACHE: dict = {}
 _ROBOTS_LOCK = threading.Lock()
+_ROBOTS_DENIALS_REPORTED: set[tuple[str, str]] = set()
 
 
 def robots_allows(url: str) -> bool:
@@ -1481,9 +1538,17 @@ def robots_allows(url: str) -> bool:
     if rp is None:
         return True
     try:
-        return rp.can_fetch(USER_AGENT, url)
+        allowed = rp.can_fetch(USER_AGENT, url)
     except Exception:
         return True
+    if not allowed:
+        denial_key = (base, parsed.path)
+        with _ROBOTS_LOCK:
+            first_report = denial_key not in _ROBOTS_DENIALS_REPORTED
+            _ROBOTS_DENIALS_REPORTED.add(denial_key)
+        if first_report:
+            log(f"robots.txt interdit : {url} — source ignorée")
+    return allowed
 
 
 # --- Délai poli par domaine ---
@@ -1585,7 +1650,6 @@ def fetch(url: str, retries: int = 3):
     if cached_html is not None:
         return BeautifulSoup(cached_html, "lxml")
     if not robots_allows(url):
-        log(f"robots.txt interdit : {url} — ignoré")
         return None
     for attempt in range(retries):
         _polite_wait(url)
@@ -1626,9 +1690,14 @@ def url_is_dead(url: str) -> bool:
     try:
         _polite_wait(url)
         r = session().head(url, timeout=10, allow_redirects=True)
-        if r.status_code == 405:           # HEAD refusé : on retente en GET léger
+        # Certains CDN renvoient un faux 404 à HEAD. Une suppression d'archive
+        # exige donc toujours la confirmation par un GET léger.
+        if r.status_code in (404, 405, 410):
             _polite_wait(url)
-            r = session().get(url, timeout=15)
+            r = session().get(
+                url, timeout=15, allow_redirects=True,
+                headers={**HEADERS, "Range": "bytes=0-2047"},
+            )
         dead = r.status_code in (404, 410)
         if _RUN_CACHE_ENABLED:
             with _RUN_CACHE_LOCK:
@@ -2089,9 +2158,27 @@ def finalize(job: dict) -> dict:
     desc = sanitize_description(job.get("description", ""), job["title"])
     job["description"] = desc
     job["score"] = relevance_score(job["title"], desc)
+    job["fit_tier"] = job_fit_tier(job)
+    if (not is_meaningful_company(job.get("company", ""))
+            and not is_meaningful_company(job.get("employer", ""))):
+        employer = extract_employer(f"{job['title']} {desc}")
+        if employer:
+            job["employer"] = employer
+    job["rank_score"] = ranking_score(job)
     if not job.get("taux"):
         job["taux"] = extract_taux(job["title"] + " " + desc)
     return job
+
+
+def is_job_document_link(job: dict) -> bool:
+    """Repère une pièce jointe (PDF/cahier des charges) prise pour une annonce."""
+    title = normalize(job.get("title", ""))
+    url = normalize(job.get("url", ""))
+    return (
+        title.endswith(".pdf")
+        or "wd_portal.view_blob" in url
+        or ("p_type=jobdoc" in url and "cahier des charges" in title)
+    )
 
 
 def passes_filters(job: dict) -> bool:
@@ -2102,6 +2189,8 @@ def passes_filters(job: dict) -> bool:
     """
     title = job.get("title", "")
     description = job.get("description", "")
+    if is_job_document_link(job):
+        return False
     if not is_french_text(title, description) or not strict_title_match(title):
         return False
     if relevance_score(title, description) < MIN_SCORE:
@@ -2185,7 +2274,7 @@ def job_employer(job: dict) -> str:
 
 _TITLE_AGE_PREFIX_RE = re.compile(
     r"^(?:aujourd['’]hui|hier|avant-hier|cette semaine|la semaine derni[eè]re|"
-    r"le mois dernier|le trimestre dernier|il y a\s+\d+\s+"
+    r"l['’]ann[ée]e derni[eè]re|le mois dernier|le trimestre dernier|il y a\s+\d+\s+"
     r"(?:heures?|jours?|semaines?|mois|trimestres?|ans?))\b"
     r"\s*(?:[·|:–—-]\s*)?",
     re.IGNORECASE,
@@ -2198,15 +2287,23 @@ _TITLE_LOCATION_SUFFIX_RE = re.compile(
     r"\s*[-–—|]\s*(?:gen[eè]ve|geneva|genf|carouge|meyrin|vernier|onex|nyon)\s*$",
     re.IGNORECASE,
 )
+_TITLE_NOISE_SUFFIX_RE = re.compile(
+    r"(?:\s*[|–—-]?\s*d[ée]tails? du poste(?:\s*[|–—-].*)?|"
+    r"\s+\d{1,2}\s+(?:janv\.?|f[ée]vr\.?|mars|avr\.?|mai|juin|juil\.?|"
+    r"ao[uû]t|sept\.?|oct\.?|nov\.?|d[ée]c\.?)\s*)$",
+    re.IGNORECASE,
+)
 
 
 def clean_job_title(title: str) -> str:
     """Retire les marqueurs ajoutés par les plateformes, sans altérer le métier."""
     cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
+    cleaned = re.sub(r"^[?¿!]+\s*", "", cleaned)
     previous = None
     while previous != cleaned:
         previous = cleaned
         cleaned = _TITLE_AGE_PREFIX_RE.sub("", cleaned).strip(" ·|:–—-")
+        cleaned = _TITLE_NOISE_SUFFIX_RE.sub("", cleaned).strip(" ·|:–—-")
     return cleaned or str(title or "").strip()
 
 
@@ -2320,6 +2417,12 @@ def title_fingerprint(title: str) -> str:
         flags=re.IGNORECASE,
     )
     stable = re.sub(r"\(?\s*\d{1,3}\s*%\s*\)?", " ", stable)
+    # Référence interne ajoutée par certains ATS : le titre métier reste stable
+    # entre la source directe et sa reprise par un agrégateur.
+    stable = re.sub(
+        r"\s*\((?=[A-Z0-9-]{8,}\))(?=(?:[^-]*-){2,})[A-Z0-9-]+\)\s*$",
+        " ", stable,
+    )
     stable = normalize(stable)
     stable = re.sub(r"\b\d+\s+vues?\b", " ", stable)
     stable = _TITLE_GENDER_SUFFIX_RE.sub("", stable)
@@ -2339,6 +2442,22 @@ _MULTILINGUAL_TITLE_CONCEPTS = {
         inflect=False,
     ),
 }
+_CROSS_LANGUAGE_ROLES = {
+    "editorial_manager": _compile_terms(
+        ["responsable éditorial", "responsable éditoriale", "editorial manager"],
+        inflect=False,
+    ),
+    "public_relations": _compile_terms(
+        ["responsable relations publiques", "spécialiste relations publiques",
+         "public relations specialist", "public relations officer"],
+        inflect=False,
+    ),
+    "communications_officer": _compile_terms(
+        ["chargé de communication", "chargée de communication",
+         "communications officer", "communication officer"],
+        inflect=False,
+    ),
+}
 
 
 def multilingual_title_fingerprint(title: str) -> str:
@@ -2348,9 +2467,12 @@ def multilingual_title_fingerprint(title: str) -> str:
         concept for concept, patterns in _MULTILINGUAL_TITLE_CONCEPTS.items()
         if term_in(norm, patterns)
     }
-    if "consultant" not in concepts or "kubernetes" not in concepts:
-        return ""
-    return "|".join(sorted(concepts))
+    if "consultant" in concepts and "kubernetes" in concepts:
+        return "|".join(sorted(concepts))
+    for role, patterns in _CROSS_LANGUAGE_ROLES.items():
+        if term_in(norm, patterns):
+            return f"role:{role}"
+    return ""
 
 
 def employer_fingerprint(value: str) -> str:
@@ -2361,7 +2483,15 @@ def employer_fingerprint(value: str) -> str:
         " ",
         stable,
     )
-    return re.sub(r"[^a-z0-9]+", "", stable)
+    compact = re.sub(r"[^a-z0-9]+", "", stable)
+    aliases = {
+        "aeroportinternationaldegeneve": "geneveaeroport",
+        "geneveaeroport": "geneveaeroport",
+        "hughopitauxuniversitairesdegeneve": "hopitauxuniversitairesgeneve",
+        "hopitauxuniversitairesdegeneve": "hopitauxuniversitairesgeneve",
+        "infomaniaktheethicalcloud": "infomaniak",
+    }
+    return aliases.get(compact, compact)
 
 
 def is_duplicate(job: dict, fp_to_known: dict, seen_urls: set | None = None,
@@ -2416,16 +2546,99 @@ def is_duplicate(job: dict, fp_to_known: dict, seen_urls: set | None = None,
 
 
 def deduplicate_jobs(jobs: list) -> list:
-    """Retourne la meilleure variante de chaque annonce, toutes sources confondues."""
-    ordered = sorted(
-        jobs,
-        key=lambda item: (0 if job_employer(item) else 1, item.get("found_at", "")),
-    )
-    fingerprints, urls, postings = {}, set(), set()
-    return [
-        item for item in ordered
-        if not is_duplicate(item, fingerprints, urls, postings)
-    ]
+    """Fusionne les variantes d'une annonce en gardant la fiche la plus riche.
+
+    Deux identifiants distincts d'un même ATS restent deux réquisitions. Des
+    identifiants propres à deux diffuseurs différents ne suffisent pas à créer
+    deux lignes pour un même titre chez le même employeur.
+    """
+    def quality(item: dict) -> tuple:
+        source = normalize(item.get("source", ""))
+        structured = sum(bool(item.get(key)) for key in (
+            "date_posted", "valid_through", "employment_type", "salary",
+            "external_id", "posting_id",
+        ))
+        return (
+            -int(bool(source) and source not in AGGREGATOR_SOURCES),
+            -int(bool(job_employer(item))), -structured,
+            -len(str(item.get("description", "") or "")),
+            str(item.get("found_at", "")), canonical_url(item.get("url", "")),
+        )
+
+    def merge(primary: dict, duplicate: dict):
+        sources = set(primary.get("alternate_sources", []))
+        sources.update(duplicate.get("alternate_sources", []))
+        sources.update(filter(None, (primary.get("source"), duplicate.get("source"))))
+        if len(sources) > 1:
+            primary["alternate_sources"] = sorted(sources)
+        for flag in ("_new", "_new_review"):
+            if duplicate.get(flag):
+                primary[flag] = True
+        for key in (
+            "company", "employer", "location", "date_posted", "valid_through",
+            "employment_type", "job_location_type", "salary", "taux",
+        ):
+            if not primary.get(key) and duplicate.get(key):
+                primary[key] = duplicate[key]
+        if len(str(duplicate.get("description", "") or "")) > len(
+            str(primary.get("description", "") or "")
+        ):
+            primary["description"] = duplicate["description"]
+        dates = [value for value in (
+            primary.get("found_at", ""), duplicate.get("found_at", "")
+        ) if value]
+        if dates:
+            primary["found_at"] = min(dates)
+        for key in ("score", "rank_score"):
+            primary[key] = max(
+                int(primary.get(key, 0) or 0), int(duplicate.get(key, 0) or 0)
+            )
+
+    kept: list[dict] = []
+    metadata: list[tuple[str, str, str, str, str]] = []
+    for original in sorted(jobs, key=quality):
+        item = dict(original)
+        url_key = canonical_url(item.get("url", ""))
+        posting_key = posting_identity(item)
+        posting_owner = posting_key.rsplit("|", 1)[0] if posting_key else ""
+        semantic = multilingual_title_fingerprint(item.get("title", ""))
+        fingerprint = (
+            f"multi:{semantic}" if semantic else title_fingerprint(item.get("title", ""))
+        )
+        employer = employer_fingerprint(job_employer(item))
+        duplicate_index = None
+        for index, (known_url, known_posting, known_owner,
+                    known_fingerprint, known_employer) in enumerate(metadata):
+            if url_key and url_key == known_url:
+                duplicate_index = index
+                break
+            if posting_key and posting_key == known_posting:
+                duplicate_index = index
+                break
+            if fingerprint != known_fingerprint:
+                continue
+            if employer and known_employer and employer != known_employer:
+                continue
+            if (posting_key and known_posting and posting_key != known_posting
+                    and posting_owner == known_owner):
+                continue
+            duplicate_index = index
+            break
+        if duplicate_index is None:
+            kept.append(item)
+            metadata.append((
+                url_key, posting_key, posting_owner, fingerprint, employer,
+            ))
+        else:
+            merge(kept[duplicate_index], item)
+            known_url, known_posting, known_owner, known_fingerprint, _ = metadata[
+                duplicate_index
+            ]
+            metadata[duplicate_index] = (
+                known_url, known_posting, known_owner, known_fingerprint,
+                employer_fingerprint(job_employer(kept[duplicate_index])),
+            )
+    return kept
 
 
 # Zone géographique acceptée : Genève + district de Nyon proche
@@ -2487,6 +2700,17 @@ GEO_SWISS_CANTONS = {
     "thurgovie": "Thurgovie", "thurgau": "Thurgovie",
     "uri": "Uri", "vaud": "Vaud", "waadt": "Vaud",
 }
+SWISS_CANTON_CODES = {
+    "AG": "Argovie", "AI": "Appenzell Rhodes-Intérieures",
+    "AR": "Appenzell Rhodes-Extérieures", "BE": "Berne",
+    "BL": "Bâle-Campagne", "BS": "Bâle-Ville", "FR": "Fribourg",
+    "GE": "Genève", "GL": "Glaris", "GR": "Grisons", "JU": "Jura",
+    "LU": "Lucerne", "NE": "Neuchâtel", "NW": "Nidwald",
+    "OW": "Obwald", "SG": "Saint-Gall", "SH": "Schaffhouse",
+    "SO": "Soleure", "SZ": "Schwyz", "TG": "Thurgovie",
+    "TI": "Tessin", "UR": "Uri", "VD": "Vaud", "VS": "Valais",
+    "ZG": "Zoug", "ZH": "Zurich",
+}
 GEO_FAR_CITY_CANTONS = {
     "lausanne": "Vaud", "morges": "Vaud", "gland": "Vaud", "rolle": "Vaud",
     "yverdon": "Vaud", "vevey": "Vaud", "montreux": "Vaud", "aigle": "Vaud",
@@ -2524,7 +2748,8 @@ def structured_geography(text: str) -> dict:
     diagnostics. Ils correspondent au niveau de preuve trouvé, sans prétendre
     déduire une adresse complète.
     """
-    norm = normalize(text)
+    raw_text = str(text or "")
+    norm = normalize(raw_text)
     postal_match = re.search(r"(?<!\d)([1-9]\d{3})(?!\d)", norm)
     postal_code = int(postal_match.group(1)) if postal_match else None
     target_postcode = postal_code if postal_code in TARGET_POSTCODES else None
@@ -2533,6 +2758,17 @@ def structured_geography(text: str) -> dict:
         r"(?:$|[,;/|\s])",
         norm,
     ))
+    canton_code_match = re.search(
+        r"(?:^|[,;/|]\s*|\bCH[-\s])([A-Z]{2})(?=\s*(?:[,;/|]|$|\d{4}\b))",
+        raw_text,
+    ) or re.search(r"\b([A-Z]{2})\b(?=\s+\d{4}\b)", raw_text)
+    canton_code = canton_code_match.group(1) if canton_code_match else ""
+    canton_from_code = SWISS_CANTON_CODES.get(canton_code, "")
+    swiss_marker = bool(re.search(r"\b(?:ch|suisse|switzerland|schweiz)\b", norm))
+    # FR et BE sont aussi des codes pays. Sans code postal ou marqueur suisse,
+    # « Paris, FR » et « Bruxelles, BE » doivent rester des lieux étrangers.
+    if canton_code in {"FR", "BE"} and not (postal_code or swiss_marker):
+        canton_from_code = ""
     # Les codes pays très courts ne sont interprétés que comme un champ final
     # délimité : « us » dans une phrase ne doit pas devenir une preuve de pays.
     iso_match = re.search(
@@ -2572,26 +2808,37 @@ def structured_geography(text: str) -> dict:
         "",
     )
     if (far_city or foreign_city or foreign_country or foreign_iso
+            or (canton_from_code and canton_from_code not in {"Genève", "Vaud"})
+            or (swiss_canton and swiss_canton != "Vaud")
+            or (canton_from_code == "Vaud" and postal_code
+                and not target_postcode and not city)
+            or (swiss_canton == "Vaud" and postal_code
+                and not target_postcode and not city)
             or (explicit_swiss_postcode and not target_postcode)):
         evidence = (
             far_city or foreign_city or foreign_country or foreign_iso
+            or canton_code
             or str(postal_code)
         )
         return {
             "status": "outside", "postal_code": postal_code,
             "country": (
                 foreign_country or FOREIGN_ISO_CODES.get(foreign_iso, "")
-                or ("Suisse" if far_city or explicit_swiss_postcode else "")
+                or ("Suisse" if (
+                    far_city or explicit_swiss_postcode
+                    or canton_from_code or swiss_canton
+                ) else "")
             ),
-            "canton": swiss_canton or GEO_FAR_CITY_CANTONS.get(far_city, ""),
+            "canton": (canton_from_code or swiss_canton
+                       or GEO_FAR_CITY_CANTONS.get(far_city, "")),
             "city": far_city or foreign_city,
             "evidence": evidence,
         }
-    if city or target_postcode or target_region:
+    if city or target_postcode or target_region or canton_from_code == "Genève":
         canton = (
             "Genève"
             if city in GENEVE_ZONE or target_region
-            or target_postcode in GENEVE_POSTCODES
+            or target_postcode in GENEVE_POSTCODES or canton_from_code == "Genève"
             else "Vaud"
         )
         return {
@@ -2688,6 +2935,8 @@ def filter_reason(job: dict) -> str:
     title = job.get("title", "")
     description = job.get("description", "")
     title_norm = normalize(title)
+    if is_job_document_link(job):
+        return "document_annexe_sans_offre"
     if not is_french_text(title, description):
         return "langue_non_prise_en_charge"
     if term_in(title_norm, _TITLE_EXCLUDE_RE) or term_in(title_norm, _EXCLUDE_RE):
@@ -2710,6 +2959,8 @@ def review_candidate(job: dict) -> tuple[bool, list]:
     title = job.get("title", "")
     description = job.get("description", "")
     title_norm = normalize(title)
+    if is_job_document_link(job):
+        return False, []
     if not is_french_text(title, description):
         return False, []
     if term_in(title_norm, _TITLE_EXCLUDE_RE) or term_in(title_norm, _EXCLUDE_RE):
@@ -3117,11 +3368,14 @@ def _parse_jobscout24_page(html: str, base: str, fallback_location: str = "",
             continue
         container = link.find_parent(["li", "article"]) or _job_card(link)
         location = container.get_text(" ", strip=True)[:300] if container else ""
+        company = ""
         if container:
             spans = container.select("p.job-attributes span, .job-location, .location")
             if spans:
                 texts = [span.get_text(strip=True) for span in spans]
                 location = texts[1] if len(texts) > 1 else texts[0]
+                company = texts[0] if len(texts) > 1 else ""
+            company = _company_from_card(container, company)
         # Le filtre de région du portail n'est pas une preuve suffisante : il a
         # déjà renvoyé des cartes de toute la Suisse. On conserve donc le lieu
         # extrait tel quel au lieu de transformer un lieu inconnu en Genève.
@@ -3130,7 +3384,10 @@ def _parse_jobscout24_page(html: str, base: str, fallback_location: str = "",
         ):
             continue
         seen.add(url_key)
-        offers.append({"title": title, "url": full_url, "location": location})
+        offers.append({
+            "title": title, "url": full_url, "location": location,
+            "company": company,
+        })
     return offers
 
 
@@ -3178,7 +3435,7 @@ def scrape_jobscout24() -> list:
                 ):
                     # Le filtre géographique fin est de toute façon dans consider()
                     consider(offer["title"], offer["url"],
-                             {"company": "—", "source": "jobscout24.ch",
+                             {"company": offer.get("company", ""), "source": "jobscout24.ch",
                               "location": offer["location"], "_query": kw,
                               "_trusted_geo": False}, jobs, seen_urls)
             except Exception as e:
@@ -3217,7 +3474,10 @@ def _parse_jobup_page(html: str, base: str, fallback_location: str = "",
         ):
             continue
         seen.add(url_key)
-        offers.append({"title": title, "url": full_url, "location": location})
+        offers.append({
+            "title": title, "url": full_url, "location": location,
+            "company": _company_from_card(card, ""),
+        })
     return offers
 
 
@@ -3258,7 +3518,7 @@ def scrape_jobup() -> list:
                     r.text, BASE, fallback_location, zone_filter
                 ):
                     consider(offer["title"], offer["url"],
-                             {"company": "—", "source": "jobup.ch",
+                             {"company": offer.get("company", ""), "source": "jobup.ch",
                               "location": offer["location"], "_query": kw,
                               "_trusted_geo": True}, jobs, seen_urls)
             except Exception as e:
@@ -3517,6 +3777,7 @@ INDEED_QUERIES = [
 def scrape_indeed_pw() -> list:
     """Offres Indeed CH via Playwright. Nécessite Chromium Playwright."""
     if not ENABLE_INDEED:
+        log("Indeed : désactivé par configuration — source ignorée")
         return []                # désactivé par défaut (anti-bot) — cf. ENABLE_INDEED
     if not PLAYWRIGHT_AVAILABLE:
         log("Indeed : Playwright non installé — source ignorée")
@@ -3629,6 +3890,7 @@ def _parse_jobs_ch_page(html: str, base: str = "https://www.jobs.ch") -> list:
             "title": title,
             "url": full_url,
             "location": location or "Genève",
+            "company": _company_from_card(card, ""),
         })
     return offers
 
@@ -3667,7 +3929,7 @@ def scrape_jobs_ch_pw() -> list:
                 for offer in _parse_jobs_ch_page(page.content()):
                     consider(
                         offer["title"], offer["url"],
-                        {"company": "", "source": "jobs.ch",
+                        {"company": offer.get("company", ""), "source": "jobs.ch",
                          "location": offer["location"],
                          "_query": term, "_trusted_geo": True},
                         jobs, seen_urls,
@@ -3777,6 +4039,10 @@ def scrape_unige() -> list:
             href = a.get("href", "")
             # On écarte les liens de navigation du portail
             if not title or len(title) < 8 or not href:
+                continue
+            href_norm = normalize(href)
+            if (href_norm.endswith(".pdf") or "wd_portal.view_blob" in href_norm
+                    or normalize(title).endswith(".pdf")):
                 continue
             low = title.lower()
             if any(skip in low for skip in ("recherche", "connexion", "retour",
@@ -4181,7 +4447,8 @@ def _company_from_card(card, fallback: str = "—") -> str:
     if card is None:
         return fallback
     el = card.select_one(
-        "[itemprop='hiringOrganization'], [class*='company'], [class*='Company'], "
+        "[itemprop='hiringOrganization'], [data-cy*='company'], "
+        "[data-testid*='company'], [class*='company'], [class*='Company'], "
         "[class*='employer'], [class*='Employer']"
     )
     company = el.get_text(" ", strip=True) if el else ""
@@ -4385,6 +4652,11 @@ def _parse_wipo_listing(html: str, base_url: str) -> list:
 def scrape_wipo() -> list:
     """OMPI/WIPO — sections officielles Taleo (personnel et affiliations)."""
     LIST_URLS = (
+        ("https://wipo.taleo.net/careersection/wp_2_gs/jobsearch.ftl"
+         "?lang=en&portal=50305027338"),
+        ("https://wipo.taleo.net/careersection/wp_2_pd/jobsearch.ftl"
+         "?lang=en&portal=50305027338"),
+        # Anciennes routes gardées en repli pendant la migration Taleo.
         "https://wipo.taleo.net/careersection/wp_2/moresearch.ftl?lang=en",
         "https://wipo.taleo.net/careersection/wp_1/moresearch.ftl?lang=en",
         "https://wipo.taleo.net/careersection/wp_internship/moresearch.ftl?lang=en",
@@ -4415,7 +4687,7 @@ def scrape_job_room() -> list:
     """Job-Room — recherche publique Systèmes à Genève via son interface JS."""
     if ACTIVE_PROFILE != "systemes":
         return []
-    LIST_URL = "https://www.job-room.ch/home/latest/index.html"
+    LIST_URL = "https://www.job-room.ch/"
     SOURCE = "job-room.ch"
     jobs, seen_urls = [], set()
     mark_raw_source(SOURCE)
@@ -4433,13 +4705,19 @@ def scrape_job_room() -> list:
                 page.goto(LIST_URL, wait_until="domcontentloaded", timeout=25000)
                 page.wait_for_timeout(2500)
                 keyword = page.get_by_label(
-                    re.compile(r"Keywords|Mots-cl[ée]s|comp[ée]tences", re.I))
+                    re.compile(
+                        r"Keywords|Mots-cl[ée]s|comp[ée]tences|Occupations|"
+                        r"Professions|m[ée]tiers|cat[ée]gories", re.I,
+                    ))
                 if not keyword.count():
                     keyword = page.get_by_placeholder(
                         re.compile(r"Keywords|Mots-cl[ée]s|profession|emploi", re.I)
                     )
                 location = page.get_by_label(
-                    re.compile(r"Canton|Work location|Lieu de travail", re.I))
+                    re.compile(
+                        r"Canton|Region|R[ée]gion|Work location|Lieu de travail",
+                        re.I,
+                    ))
                 if keyword.count():
                     keyword.first.fill("system engineer linux")
                     keyword.first.press("Enter")
@@ -4506,7 +4784,7 @@ def scrape_sig() -> list:
 
 def scrape_tpg() -> list:
     """Transports publics genevois — portail SuccessFactors rendu en JavaScript."""
-    LIST_URL = (
+    fallback_url = (
         "https://career5.successfactors.eu/career?company=transpor01"
         "&career_ns=job_listing_summary&navBarLevel=JOB_SEARCH"
     )
@@ -4517,6 +4795,15 @@ def scrape_tpg() -> list:
     SOURCE = "tpg.ch"
     jobs, seen_urls = [], set()
     mark_raw_source(SOURCE)
+    LIST_URL = fallback_url
+    landing_url = "https://www.tpg.ch/fr/travailler-aux-tpg"
+    landing = fetch(landing_url)
+    if landing:
+        career_link = landing.select_one(
+            "a[href*='successfactors.eu'], a[href*='successfactors.com']"
+        )
+        if career_link and career_link.get("href"):
+            LIST_URL = urljoin(landing_url, career_link["href"])
     if not robots_allows(LIST_URL):
         return jobs
     soup = fetch_via_playwright(LIST_URL, wait_selector=SELECTOR)
@@ -4551,14 +4838,17 @@ def _parse_un_job_feed(html: str, base_url: str) -> list:
             if len(parent_text) > 3500:
                 break
             node, context = parent, parent_text
-            if re.search(r"Duty Station\s*:", context, re.I):
+            if re.search(r"(?:Duty Station|Lieu d['’]affectation)\s*:", context, re.I):
                 break
         duty = re.search(
-            r"Duty Station\s*:\s*(.+?)(?=\s+(?:Staffing Exercise|Date Posted|Deadline|$))",
+            r"(?:Duty Station|Lieu d['’]affectation)\s*:\s*(.+?)"
+            r"(?=\s+(?:Staffing Exercise|Date Posted|Deadline|Exercice de dotation|"
+            r"Date de publication|Date limite|$))",
             context, re.I,
         )
         office = re.search(
-            r"Department/Office\s*:\s*(.+?)(?=\s+Duty Station\s*:)",
+            r"(?:Department/Office|D[ée]partement/Bureau)\s*:\s*(.+?)"
+            r"(?=\s+(?:Duty Station|Lieu d['’]affectation)\s*:)",
             context, re.I,
         )
         seen.add(match.group(1))
@@ -4573,28 +4863,34 @@ def _parse_un_job_feed(html: str, base_url: str) -> list:
 
 def scrape_un_geneva() -> list:
     """ONU Genève — flux public structuré, avec repli navigateur."""
-    LIST_URL = "https://careers.un.org/jobfeed?isPage=true&language=en"
+    LIST_URLS = (
+        "https://careers.un.org/jobfeed?isPage=true&language=en",
+        "https://careers.un.org/jobfeed?isPage=true&language=fr",
+    )
     SELECTOR = "a[href*='/jobSearchDescription/']"
     SOURCE = "careers.un.org"
     jobs, seen_urls = [], set()
     mark_raw_source(SOURCE)
-    if not robots_allows(LIST_URL):
-        return jobs
-    soup = fetch(LIST_URL)
-    if not soup or not soup.select_one(SELECTOR):
-        soup = fetch_via_playwright(LIST_URL, wait_selector=SELECTOR)
-    if not soup:
-        return jobs
-    for offer in _parse_un_job_feed(str(soup), LIST_URL):
-        if structured_geography(offer["location"])["status"] != "target":
+    for list_url in LIST_URLS:
+        if not robots_allows(list_url):
             continue
-        consider(
-            offer["title"], offer["url"],
-            {"company": offer["company"], "source": SOURCE,
-             "location": offer["location"], "description": offer["description"],
-             "external_id": offer["external_id"]},
-            jobs, seen_urls,
-        )
+        soup = fetch(list_url)
+        if not soup or not soup.select_one(SELECTOR):
+            soup = fetch_via_playwright(list_url, wait_selector=SELECTOR)
+        if not soup:
+            continue
+        for offer in _parse_un_job_feed(str(soup), list_url):
+            if structured_geography(offer["location"])["status"] != "target":
+                continue
+            consider(
+                offer["title"], offer["url"],
+                {"company": offer["company"], "source": SOURCE,
+                 "location": offer["location"], "description": offer["description"],
+                 "external_id": offer["external_id"]},
+                jobs, seen_urls,
+            )
+        if jobs:
+            break
     log(f"ONU Genève: {len(jobs)} offre(s) trouvée(s)")
     return jobs
 
@@ -5483,14 +5779,17 @@ def update_health(source: str, count: int, health: dict,
     # distingue une vraie panne d'une simple absence d'offre pertinente. Détectable
     # dès le 1er run KO (pas besoin d'attendre N runs).
     if raw is not None:
-        if raw == 0 and entry.get("raw_max", 0) > 0:
+        empty_runs = int(entry.get("consecutive_raw_empty", 0) or 0)
+        if (raw == 0 and entry.get("raw_max", 0) > 0
+                and empty_runs in {1, 3, 10, 20}):
             alerts.append(
                 f"🚨 {label} : 0 candidat brut extrait (jusqu'à {entry['raw_max']} "
-                f"auparavant) — page/sélecteur probablement cassé."
+                f"auparavant) depuis {empty_runs} passage(s) consécutif(s) — "
+                "page/sélecteur probablement cassé."
             )
-        elif raw == 0 and entry["runs"] >= 5:
+        elif raw == 0 and entry.get("raw_max", 0) == 0 and empty_runs in {5, 10, 20}:
             alerts.append(
-                f"🔇 {label} : 0 candidat brut depuis {entry['runs']} runs "
+                f"🔇 {label} : 0 candidat brut depuis {empty_runs} passages "
                 f"(jamais aucun résultat) — source à déboguer ou repointer."
             )
         # raw > 0 : la source fonctionne ; 0 offre PERTINENTE n'est pas une panne.
@@ -5640,6 +5939,9 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
             location = display_location(job.get("location", ""))
             source = job.get("source", "—")
             score = int(job.get("score", 0) or 0)
+            fit = job.get("fit_tier") or job_fit_tier(job)
+            rank = ranking_score(job)
+            fit_label = "Cœur de cible" if fit == "core" else "Métier connexe"
             found_at = job.get("found_at", "")
             try:
                 found_date = parse_local_datetime(found_at).strftime("%d.%m.%Y")
@@ -5681,6 +5983,7 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
                 f'data-search="{escape(normalize(search_text))}" '
                 f'data-source="{escape(source)}" data-location="{escape(location)}" '
                 f'data-company="{escape(company)}" data-score="{score}" '
+                f'data-rank="{rank}" data-fit="{escape(fit)}" '
                 f'data-date="{escape(found_at)}" data-title="{escape(normalize(title))}">'
                 f'<td data-label="Poste"><a class="job-title" href="{escape(job.get("url", ""))}" '
                 f'target="_blank" rel="noopener noreferrer">{escape(title)} '
@@ -5689,8 +5992,9 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
                 f'<td data-label="Lieu">{escape(location)}</td>'
                 f'<td data-label="Conditions"><div class="details">{detail_html}</div></td>'
                 f'<td data-label="Source">{escape(source)}</td>'
-                f'<td data-label="Pertinence"><span class="score score-{min(score // 2, 3)}" '
-                f'title="Score {score}. {escape(_score_label(score))}. '
+                f'<td data-label="Priorité"><span class="fit-tier fit-{escape(fit)}">'
+                f'{escape(fit_label)}</span> <span class="score score-{min(score // 2, 3)}" '
+                f'title="Priorité {rank}. Score métier {score}. {escape(_score_label(score))}. '
                 f'{escape("Mots-clés : " + ", ".join(keywords)) if keywords else ""}">'
                 f'{escape(_score_label(score))} <strong>{score}</strong></span></td>'
                 f'<td data-label="Ajoutée"><time datetime="{escape(found_at)}" '
@@ -5710,7 +6014,7 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
 <th scope="col"><button class="sort-button" data-sort="title">Poste</button></th>
 <th scope="col"><button class="sort-button" data-sort="company">Entreprise</button></th>
 <th scope="col">Lieu</th><th scope="col">Conditions</th><th scope="col">Source</th>
-<th scope="col"><button class="sort-button" data-sort="score">Pertinence</button></th>
+<th scope="col"><button class="sort-button" data-sort="rank">Priorité</button></th>
 <th scope="col"><button class="sort-button" data-sort="date">Ajoutée</button></th>
 <th scope="col">Suivi</th></tr></thead>"""
 
@@ -5753,7 +6057,7 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
 <main class="shell" id="offres">
 <section class="hero"><div><p class="eyebrow">Genève et district de Nyon proche</p>
 <h1>{escape(ACTIVE_PROFILE_CONFIG['title'])}</h1>
-<p class="updated">Mise à jour le {now}. Offres triées de la plus récente à la plus ancienne.</p></div>
+<p class="updated">Mise à jour le {now}. Offres classées par proximité métier, qualité de la fiche puis fraîcheur.</p></div>
 <div class="hero-stats"><div><strong>{len(all_jobs)}</strong><span>offres</span></div>
 <div><strong>{len(new_jobs)}</strong><span>nouvelles</span></div>
 <div><strong>{len(review_jobs)}</strong><span>à vérifier</span></div></div></section>
@@ -5765,13 +6069,15 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
 <label class="search-field">Recherche<input id="search" type="search" placeholder="Poste, entreprise, mot-clé…" autocomplete="off"></label>
 <label>Lieu<select id="location-filter"><option value="">Tous les lieux</option>{location_options}</select></label>
 <label>Source<select id="source-filter"><option value="">Toutes les sources</option>{source_options}</select></label>
+<label>Cible<select id="fit-filter"><option value="">Tous les métiers</option><option value="core">Cœur de cible</option>
+<option value="adjacent">Métiers connexes</option></select></label>
 <label>Score minimal<select id="score-filter"><option value="0">Tous</option><option value="2">2 — Pertinent</option>
 <option value="4">4 — Forte correspondance</option><option value="6">6 — Très pertinent</option></select></label>
 <label>Date d’ajout<select id="date-filter"><option value="0">Toutes</option><option value="1">24 heures</option>
 <option value="7">7 jours</option><option value="30">30 jours</option></select></label>
 <label>État<select id="status-filter"><option value="">Tous</option><option value="review">À examiner</option>
 <option value="applied">Candidature envoyée</option><option value="ignored">Ignorée</option></select></label>
-<label>Trier par<select id="sort-select"><option value="date-desc">Plus récentes</option><option value="score-desc">Meilleur score</option>
+<label>Trier par<select id="sort-select"><option value="rank-desc">Meilleure priorité</option><option value="date-desc">Plus récentes</option><option value="score-desc">Meilleur score métier</option>
 <option value="title-asc">Poste A–Z</option><option value="company-asc">Entreprise A–Z</option></select></label>
 </div>
 <div class="filter-toggles"><label><input id="favorites-only" type="checkbox"> Favoris uniquement</label>
@@ -5783,10 +6089,10 @@ def generate_html(new_jobs: list, all_jobs: list, review_jobs: list | None = Non
 <label class="button secondary" for="import-tracking">Importer le suivi</label>
 <input id="import-tracking" class="sr-only" type="file" accept="application/json"></div></div>
 
-<aside class="score-help"><strong>Comment lire la pertinence ?</strong> Un mot-clé dans le titre vaut 2 points et dans la description 1 point. Survolez un score pour voir les correspondances.</aside>
-{section('nouvelles', 'Nouvelles offres', sorted(new_jobs, key=lambda j: (j.get('score', 0), j.get('found_at', '')), reverse=True), True)}
-{section('autres', 'Autres offres', sorted(other_jobs, key=lambda j: (j.get('found_at', ''), j.get('score', 0)), reverse=True))}
-{section('a-verifier', 'Offres à vérifier', sorted(review_jobs, key=lambda j: (j.get('score', 0), j.get('found_at', '')), reverse=True), False, True)}
+<aside class="score-help"><strong>Comment lire la priorité ?</strong> « Cœur de cible » correspond directement au métier recherché. Le classement combine ce signal, le score des mots-clés et la qualité disponible de la fiche; aucune offre connexe n’est supprimée.</aside>
+{section('nouvelles', 'Nouvelles offres', sorted(new_jobs, key=lambda j: (ranking_score(j), j.get('found_at', '')), reverse=True), True)}
+{section('autres', 'Autres offres', sorted(other_jobs, key=lambda j: (ranking_score(j), j.get('found_at', '')), reverse=True))}
+{section('a-verifier', 'Offres à vérifier', sorted(review_jobs, key=lambda j: (ranking_score(j), j.get('found_at', '')), reverse=True), False, True)}
 </main>
 <footer><div class="shell">Données issues de plusieurs plateformes d’emploi. Vérifiez toujours l’annonce d’origine avant de postuler.</div></footer>
 <script src="../assets/report.js" defer></script>
@@ -5838,7 +6144,7 @@ SITE_CSS = r"""
 :root{color-scheme:light;--bg:#f6f8fc;--surface:#fff;--surface-2:#eef3fb;--text:#172033;--muted:#5c667a;--border:#dbe2ee;--primary:#1d4ed8;--primary-dark:#173ea6;--warning:#9a5a00;--shadow:0 12px 35px rgba(23,32,51,.08);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#101522;--surface:#171e2d;--surface-2:#222b3d;--text:#edf2ff;--muted:#aeb9cd;--border:#334058;--primary:#84a8ff;--primary-dark:#b2c7ff;--warning:#f7c46c;--shadow:0 12px 35px rgba(0,0,0,.3)}
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);line-height:1.5}a{color:var(--primary);text-decoration-thickness:.08em;text-underline-offset:.16em}button,input,select{font:inherit}button,.button{cursor:pointer}.shell{width:min(1440px,calc(100% - 2rem));margin-inline:auto}.skip-link{position:fixed;left:1rem;top:-5rem;z-index:100;background:var(--surface);padding:.7rem 1rem;border-radius:.5rem}.skip-link:focus{top:1rem}.site-header{position:sticky;top:0;z-index:30;background:color-mix(in srgb,var(--surface) 92%,transparent);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}.header-inner{min-height:64px;display:flex;align-items:center;gap:1.25rem}.brand{font-weight:850;color:var(--text);text-decoration:none;white-space:nowrap}.main-nav{display:flex;align-items:center;gap:.25rem;overflow:auto}.main-nav a{padding:.55rem .7rem;color:var(--muted);text-decoration:none;border-radius:.5rem;white-space:nowrap;font-size:.92rem}.main-nav a:hover,.main-nav a[aria-current="page"]{background:var(--surface-2);color:var(--text)}.header-actions{display:flex;gap:.4rem;margin-left:auto}.icon-button,.secondary,.button{border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:.55rem;padding:.48rem .72rem;text-decoration:none;font-weight:650}.icon-button:hover,.secondary:hover,.button:hover{border-color:var(--primary);color:var(--primary)}main{padding-block:2.25rem 4rem}.hero{display:flex;justify-content:space-between;gap:2rem;align-items:flex-end;margin-bottom:1.5rem}.eyebrow{color:var(--primary);font-weight:750;text-transform:uppercase;letter-spacing:.08em;font-size:.78rem;margin:0 0 .35rem}.hero h1{font-size:clamp(1.85rem,4vw,3rem);line-height:1.08;margin:0;max-width:900px}.updated{color:var(--muted);margin:.7rem 0 0}.hero-stats{display:flex;gap:.65rem}.hero-stats div{min-width:95px;background:var(--surface);border:1px solid var(--border);border-radius:.8rem;padding:.7rem 1rem;text-align:center;box-shadow:var(--shadow)}.hero-stats strong{display:block;font-size:1.55rem}.hero-stats span{color:var(--muted);font-size:.82rem}.panel{background:var(--surface);border:1px solid var(--border);border-radius:1rem;padding:1.15rem;box-shadow:var(--shadow)}.panel-title-row{display:flex;align-items:start;justify-content:space-between;gap:1rem}.panel h2{font-size:1.15rem;margin:0}.panel p{color:var(--muted);margin:.2rem 0 1rem}.filter-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem}.search-field{grid-column:span 2}.filter-grid label{min-width:0;font-size:.78rem;color:var(--muted);font-weight:700}.filter-grid input,.filter-grid select{display:block;width:100%;margin-top:.25rem;min-height:42px;border:1px solid var(--border);border-radius:.55rem;background:var(--bg);color:var(--text);padding:.55rem .65rem}.filter-grid input:focus,.filter-grid select:focus,button:focus-visible,a:focus-visible{outline:3px solid color-mix(in srgb,var(--primary) 35%,transparent);outline-offset:2px}.filter-toggles{display:flex;gap:1.25rem;flex-wrap:wrap;margin-top:.9rem;font-size:.9rem}.results-bar{display:flex;justify-content:space-between;align-items:center;gap:1rem;margin:1.2rem 0}.results-bar p{font-weight:750;margin:0}.results-bar>div{display:flex;gap:.5rem;flex-wrap:wrap}.score-help{background:color-mix(in srgb,var(--primary) 8%,var(--surface));border-left:4px solid var(--primary);padding:.75rem 1rem;border-radius:.35rem;color:var(--muted);font-size:.9rem}.score-help strong{color:var(--text)}.jobs-section{margin-top:2rem}.section-heading{border-bottom:2px solid var(--border)}.section-heading h2{font-size:1.35rem;margin:0;padding-bottom:.5rem}.count{display:inline-grid;place-items:center;min-width:1.7rem;height:1.7rem;padding:0 .4rem;border-radius:99px;background:var(--primary);color:var(--bg);font-size:.78rem;vertical-align:middle}.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:.8rem;background:var(--surface);margin-top:1rem;box-shadow:var(--shadow)}table{border-collapse:separate;border-spacing:0;width:100%;font-size:.9rem}th{background:var(--surface-2);color:var(--text);padding:.65rem .7rem;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}td{padding:.72rem;border-bottom:1px solid var(--border);vertical-align:top}tbody tr:last-child td{border-bottom:0}tbody tr:hover td{background:color-mix(in srgb,var(--primary) 5%,var(--surface))}.job-row.new td{background:color-mix(in srgb,#facc15 10%,var(--surface))}.job-row.is-favorite td:first-child{box-shadow:inset 4px 0 var(--warning)}.job-row.is-hidden{opacity:.58}.job-title{font-weight:760}.keywords{display:block;color:var(--muted);font-size:.76rem;margin-top:.3rem;max-width:38rem}.details{display:flex;gap:.3rem;flex-wrap:wrap}.detail-chip,.score{display:inline-block;border-radius:99px;padding:.18rem .48rem;font-size:.76rem;white-space:nowrap}.detail-chip{background:var(--surface-2)}.score{background:color-mix(in srgb,var(--primary) 12%,var(--surface));color:var(--primary-dark)}.score strong{margin-left:.2rem}.muted,time{color:var(--muted);white-space:nowrap}.tracking{display:flex;align-items:center;gap:.35rem;min-width:255px}.tracking select{max-width:155px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:.45rem;padding:.36rem}.tracking button{padding:.36rem .48rem}.favorite{border:0;background:transparent;color:var(--warning);font-size:1.45rem;line-height:1}.sort-button{border:0;background:transparent;color:inherit;font-weight:750;padding:0}.sort-button::after{content:" ↕";color:var(--muted)}.sort-button[data-direction="asc"]::after{content:" ↑"}.sort-button[data-direction="desc"]::after{content:" ↓"}.section-empty{color:var(--muted);background:var(--surface);border:1px dashed var(--border);border-radius:.7rem;padding:1rem}.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}[hidden]{display:none!important}footer{border-top:1px solid var(--border);padding:1.5rem 0;color:var(--muted);font-size:.85rem;background:var(--surface)}
-.job-row.review td{background:color-mix(in srgb,#f59e0b 7%,var(--surface))}.review-reason{display:block;color:var(--warning);font-size:.76rem;margin-top:.3rem;font-weight:650}.status-profile{margin-bottom:1.5rem}.status-profile h3{margin:1.4rem 0 .4rem}.freshness-warning{color:var(--warning)!important;background:color-mix(in srgb,#f59e0b 12%,var(--surface));border-left:4px solid var(--warning);padding:.65rem .8rem;border-radius:.35rem;font-weight:750}
+.job-row.review td{background:color-mix(in srgb,#f59e0b 7%,var(--surface))}.review-reason{display:block;color:var(--warning);font-size:.76rem;margin-top:.3rem;font-weight:650}.fit-tier{display:inline-block;border-radius:99px;padding:.18rem .48rem;font-size:.76rem;white-space:nowrap;font-weight:750}.fit-core{background:color-mix(in srgb,#16a34a 14%,var(--surface));color:color-mix(in srgb,#15803d 90%,var(--text))}.fit-adjacent{background:var(--surface-2);color:var(--muted)}.status-profile{margin-bottom:1.5rem}.status-profile h3{margin:1.4rem 0 .4rem}.freshness-warning{color:var(--warning)!important;background:color-mix(in srgb,#f59e0b 12%,var(--surface));border-left:4px solid var(--warning);padding:.65rem .8rem;border-radius:.35rem;font-weight:750}
 .portal-hero{padding:2rem 0 1rem}.portal-hero h1{font-size:clamp(2.1rem,6vw,4rem);line-height:1.02;margin:.3rem 0;max-width:850px}.portal-intro{font-size:1.1rem;color:var(--muted);max-width:760px}.coverage{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:1rem}.coverage span{background:var(--surface-2);border-radius:99px;padding:.35rem .65rem;font-size:.83rem}.profile-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1.5rem}.profile-card{display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--border);border-radius:1rem;padding:1.15rem;box-shadow:var(--shadow)}.profile-card h2{margin:.25rem 0;font-size:1.3rem}.profile-card>p{color:var(--muted)}.card-stats{display:flex;gap:.6rem;margin:.5rem 0 1rem}.card-stats span{background:var(--surface-2);border-radius:.5rem;padding:.4rem .55rem;font-size:.82rem}.latest{border-top:1px solid var(--border);padding-top:.8rem;margin-top:auto}.latest h3{font-size:.82rem;text-transform:uppercase;color:var(--muted);letter-spacing:.05em}.latest ul{padding-left:1.1rem}.latest li{margin:.35rem 0;font-size:.88rem}.card-actions{display:flex;gap:.5rem;align-items:center;margin-top:1rem}.primary-button{display:inline-block;background:var(--primary);color:var(--bg);border-radius:.55rem;padding:.55rem .75rem;text-decoration:none;font-weight:750}.primary-button:hover{background:var(--primary-dark)}.rss-link{font-size:.85rem}.last-update{font-size:.78rem!important}
 @media(max-width:1150px){.profile-grid{grid-template-columns:1fr 1fr}}
 @media(max-width:760px){.shell{width:min(100% - 1rem,1440px)}.header-inner{align-items:flex-start;flex-wrap:wrap;padding:.65rem 0}.main-nav{order:3;width:100%}.site-header{position:relative}.hero{align-items:flex-start;flex-direction:column}.hero-stats{width:100%}.hero-stats div{flex:1}.filter-grid{grid-template-columns:1fr 1fr}.search-field{grid-column:1/-1}.results-bar{align-items:flex-start;flex-direction:column}.profile-grid{grid-template-columns:1fr}.table-wrap{overflow:visible;border:0;background:transparent;box-shadow:none}table,thead,tbody,tr,td{display:block;width:100%}thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}tbody{display:grid;gap:.75rem}.job-row{border:1px solid var(--border);border-radius:.8rem;background:var(--surface);box-shadow:var(--shadow);overflow:hidden}.job-row td{display:grid;grid-template-columns:95px 1fr;gap:.5rem;border-bottom:1px solid var(--border);padding:.65rem}.job-row td::before{content:attr(data-label);color:var(--muted);font-size:.75rem;font-weight:750}.job-row td:first-child{display:block}.job-row td:first-child::before{display:none}.job-row td:last-child{border-bottom:0}.tracking{min-width:0;flex-wrap:wrap}.tracking select{max-width:100%}th{position:static}}
@@ -5856,11 +6162,11 @@ let migrated=false;const rowRecord=row=>{const id=row.dataset.id,legacy=row.data
 function paintRow(row){const item=rowRecord(row),favorite=row.querySelector('.favorite'),status=row.querySelector('.job-status'),hide=row.querySelector('.hide-job');row.classList.toggle('is-favorite',!!item.favorite);row.classList.toggle('is-hidden',!!item.hidden);favorite.textContent=item.favorite?'★':'☆';favorite.setAttribute('aria-label',item.favorite?'Retirer des favoris':'Ajouter aux favoris');favorite.title=favorite.getAttribute('aria-label');hide.textContent=item.hidden?'Réafficher':'Masquer';hide.title=item.hidden?'Réafficher cette offre':'Masquer cette offre';status.value=item.status||'';row.dataset.status=item.status||'review'}rows().forEach(paintRow);if(migrated)save();
 document.addEventListener('click',event=>{const favorite=event.target.closest('.favorite'),hide=event.target.closest('.hide-job');if(favorite){const row=favorite.closest('.job-row'),item=rowRecord(row);item.favorite=!item.favorite;paintRow(row);save();applyFilters()}if(hide){const row=hide.closest('.job-row'),item=rowRecord(row);item.hidden=!item.hidden;paintRow(row);save();applyFilters()}});
 document.addEventListener('change',event=>{if(event.target.matches('.job-status')){const row=event.target.closest('.job-row');rowRecord(row).status=event.target.value;paintRow(row);save();applyFilters()}});
-const controls=['search','location-filter','source-filter','score-filter','date-filter','status-filter','sort-select','favorites-only','show-hidden'];controls.forEach(id=>{const node=byId(id);node?.addEventListener(node.type==='search'?'input':'change',applyFilters)});
-function sortRows(value){const [key,direction]=value.split('-'),factor=direction==='asc'?1:-1;document.querySelectorAll('tbody').forEach(tbody=>{[...tbody.children].sort((a,b)=>{let av=a.dataset[key]||'',bv=b.dataset[key]||'';if(key==='score')return(Number(av)-Number(bv))*factor;return av.localeCompare(bv,'fr',{numeric:true,sensitivity:'base'})*factor}).forEach(row=>tbody.appendChild(row))});document.querySelectorAll('.sort-button').forEach(button=>{button.removeAttribute('data-direction');button.closest('th').removeAttribute('aria-sort')});const active=document.querySelector(`.sort-button[data-sort="${key}"]`);if(active){active.dataset.direction=direction;active.closest('th').setAttribute('aria-sort',direction==='asc'?'ascending':'descending')}}
-function applyFilters(){const query=normalize(byId('search').value),location=byId('location-filter').value,source=byId('source-filter').value,minScore=Number(byId('score-filter').value),days=Number(byId('date-filter').value),status=byId('status-filter').value,favorites=byId('favorites-only').checked,showHidden=byId('show-hidden').checked,cutoff=days?Date.now()-days*86400000:0;let visible=0;rows().forEach(row=>{const item=rowRecord(row),matches=(!query||row.dataset.search.includes(query))&&(!location||row.dataset.location===location)&&(!source||row.dataset.source===source)&&Number(row.dataset.score)>=minScore&&(!cutoff||new Date(row.dataset.date).getTime()>=cutoff)&&(!status||(item.status||'review')===status)&&(!favorites||item.favorite)&&(showHidden||!item.hidden);row.hidden=!matches;if(matches)visible++});document.querySelectorAll('.jobs-section').forEach(section=>{const count=[...section.querySelectorAll('.job-row')].filter(row=>!row.hidden).length;section.querySelector('[data-count]').textContent=count;section.querySelector('.table-wrap').hidden=count===0;section.querySelector('.section-empty').hidden=count!==0});byId('result-count').textContent=`${visible} offre${visible>1?'s':''} affichée${visible>1?'s':''}`;sortRows(byId('sort-select').value)}
+const controls=['search','location-filter','source-filter','fit-filter','score-filter','date-filter','status-filter','sort-select','favorites-only','show-hidden'];controls.forEach(id=>{const node=byId(id);node?.addEventListener(node.type==='search'?'input':'change',applyFilters)});
+function sortRows(value){const [key,direction]=value.split('-'),factor=direction==='asc'?1:-1;document.querySelectorAll('tbody').forEach(tbody=>{[...tbody.children].sort((a,b)=>{let av=a.dataset[key]||'',bv=b.dataset[key]||'';if(key==='score'||key==='rank')return(Number(av)-Number(bv))*factor;return av.localeCompare(bv,'fr',{numeric:true,sensitivity:'base'})*factor}).forEach(row=>tbody.appendChild(row))});document.querySelectorAll('.sort-button').forEach(button=>{button.removeAttribute('data-direction');button.closest('th').removeAttribute('aria-sort')});const active=document.querySelector(`.sort-button[data-sort="${key}"]`);if(active){active.dataset.direction=direction;active.closest('th').setAttribute('aria-sort',direction==='asc'?'ascending':'descending')}}
+function applyFilters(){const query=normalize(byId('search').value),location=byId('location-filter').value,source=byId('source-filter').value,fit=byId('fit-filter').value,minScore=Number(byId('score-filter').value),days=Number(byId('date-filter').value),status=byId('status-filter').value,favorites=byId('favorites-only').checked,showHidden=byId('show-hidden').checked,cutoff=days?Date.now()-days*86400000:0;let visible=0;rows().forEach(row=>{const item=rowRecord(row),matches=(!query||row.dataset.search.includes(query))&&(!location||row.dataset.location===location)&&(!source||row.dataset.source===source)&&(!fit||row.dataset.fit===fit)&&Number(row.dataset.score)>=minScore&&(!cutoff||new Date(row.dataset.date).getTime()>=cutoff)&&(!status||(item.status||'review')===status)&&(!favorites||item.favorite)&&(showHidden||!item.hidden);row.hidden=!matches;if(matches)visible++});document.querySelectorAll('.jobs-section').forEach(section=>{const count=[...section.querySelectorAll('.job-row')].filter(row=>!row.hidden).length;section.querySelector('[data-count]').textContent=count;section.querySelector('.table-wrap').hidden=count===0;section.querySelector('.section-empty').hidden=count!==0});byId('result-count').textContent=`${visible} offre${visible>1?'s':''} affichée${visible>1?'s':''}`;sortRows(byId('sort-select').value)}
 document.querySelectorAll('.sort-button').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.sort,current=button.dataset.direction||'',direction=current==='desc'?'asc':'desc';byId('sort-select').value=`${key}-${direction}`;applyFilters()}));
-byId('reset-filters')?.addEventListener('click',()=>{controls.forEach(id=>{const node=byId(id);if(!node)return;if(node.type==='checkbox')node.checked=false;else node.value=id==='sort-select'?'date-desc':''});byId('score-filter').value='0';byId('date-filter').value='0';applyFilters()});
+byId('reset-filters')?.addEventListener('click',()=>{controls.forEach(id=>{const node=byId(id);if(!node)return;if(node.type==='checkbox')node.checked=false;else node.value=id==='sort-select'?'rank-desc':''});byId('score-filter').value='0';byId('date-filter').value='0';applyFilters()});
 byId('export-tracking')?.addEventListener('click',()=>{const payload={version:2,profile,exportedAt:new Date().toISOString(),jobs:state.jobs},blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`suivi-candidatures-${profile}.json`;link.click();URL.revokeObjectURL(url)});
 byId('import-tracking')?.addEventListener('change',event=>{const file=event.target.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{try{const payload=JSON.parse(reader.result);if(!payload.jobs||typeof payload.jobs!=='object')throw new Error();state.jobs={...state.jobs,...payload.jobs};save();rows().forEach(paintRow);applyFilters();byId('result-count').textContent='Suivi importé.'}catch(_e){alert('Ce fichier de suivi est invalide.')}};reader.readAsText(file);event.target.value=''});
 byId('theme-toggle')?.addEventListener('click',()=>{const dark=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=dark?'dark':'';localStorage.setItem('find-job:theme',dark?'dark':'light')});if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('../sw.js').catch(()=>{}));applyFilters();})();
@@ -5881,14 +6187,153 @@ def generate_site_assets():
     icon = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="104" fill="#1d4ed8"/><path fill="white" d="M128 157h256v220H128z"/><path fill="#1d4ed8" d="M201 123h110a35 35 0 0 1 35 35v28h-31v-25a9 9 0 0 0-9-9H206a9 9 0 0 0-9 9v25h-31v-28a35 35 0 0 1 35-35zm-73 123h256v42H128z"/></svg>"""
     _atomic_write_text(DOCS_ROOT / "icon.svg", icon)
     cached = ["./", "./index.html", "./status.html", "./publication.json", "./assets/site.css", "./assets/report.js", "./icon.svg", "./manifest.webmanifest"] + [f"./{profile}/" for profile in PROFILES]
-    sw = "const CACHE='find-job-v2';const FILES=" + json.dumps(cached) + ";self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(FILES))));self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k))))));self.addEventListener('fetch',e=>{if(e.request.method!=='GET'||new URL(e.request.url).origin!==location.origin)return;e.respondWith(fetch(e.request).then(r=>{const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy));return r}).catch(()=>caches.match(e.request)))})\n"
+    sw = "const CACHE='find-job-v3';const FILES=" + json.dumps(cached) + ";self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>Promise.all(FILES.map(f=>c.add(f).catch(()=>undefined))))));self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k))))));self.addEventListener('fetch',e=>{if(e.request.method!=='GET'||new URL(e.request.url).origin!==location.origin)return;e.respondWith(fetch(e.request).then(r=>{const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy));return r}).catch(()=>caches.match(e.request)))})\n"
     _atomic_write_text(DOCS_ROOT / "sw.js", sw)
 
 
-def generate_status_page(published_at: datetime | None = None):
+def _profile_diagnostics(profile: str) -> tuple[dict, dict, dict]:
+    """Charge le diagnostic courant ou son dernier instantané publiable."""
+    data_dir = DATA_ROOT / profile
+    snapshot_path = DOCS_ROOT / profile / "diagnostic.json"
+    raw_health = _load_json_file(data_dir / "health.json", {})
+    raw_coverage = _load_json_file(data_dir / "query_coverage.json", {})
+    raw_rejections = _load_json_file(data_dir / "rejections.json", {})
+    health_fields = {
+        "source_field", "last_status", "last", "raw_last", "unique_last",
+        "main_last", "review_last", "duration_ms", "last_run_at", "updated_at",
+        "last_healthy_at", "last_success_at", "last_error",
+    }
+
+    def public_health_value(key: str, value):
+        if key != "last_error":
+            return value
+        return re.sub(
+            r"([?&](?:app_key|api_key|key|token|password|secret)=)[^&\s]+",
+            r"\1***", str(value), flags=re.IGNORECASE,
+        )[:500]
+
+    current = {
+        "health": {
+            name: {
+                key: public_health_value(key, value)
+                for key, value in entry.items() if key in health_fields
+            }
+            for name, entry in raw_health.items() if isinstance(entry, dict)
+        } if isinstance(raw_health, dict) else {},
+        "coverage": {
+            name: {key: entry.get(key) for key in ("last", "zero_runs", "max")}
+            for name, entry in raw_coverage.items() if isinstance(entry, dict)
+        } if isinstance(raw_coverage, dict) else {},
+        # Les exemples rejetés peuvent contenir de longues descriptions. Le
+        # diagnostic public n'a besoin que des agrégats affichés par statut.html.
+        "rejections": {
+            key: raw_rejections.get(key, {}) for key in ("counts", "by_source")
+        } if isinstance(raw_rejections, dict) else {},
+    }
+    snapshot = _load_json_file(snapshot_path, {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    changed = False
+    for key, value in current.items():
+        if isinstance(value, dict) and value:
+            snapshot[key] = value
+            changed = True
+    if changed:
+        _atomic_write_json(snapshot_path, snapshot, keep_backup=False)
+    return tuple(
+        value if isinstance(value, dict) else {}
+        for value in (
+            snapshot.get("health", {}), snapshot.get("coverage", {}),
+            snapshot.get("rejections", {}),
+        )
+    )
+
+
+def _profile_last_run(health: dict) -> str:
+    return max(
+        (str(entry.get("last_run_at") or entry.get("updated_at") or "")
+         for entry in health.values() if isinstance(entry, dict)),
+        default="",
+    )
+
+
+def _profile_summary(profile: str, now: datetime) -> dict:
+    """Construit un résumé autonome, réutilisable si un autre profil échoue."""
+    configure_profile(profile)
+    summary_path = DOCS_ROOT / profile / "summary.json"
+    data_path = DATA_ROOT / profile / "all_jobs.json"
+    review_path = DATA_ROOT / profile / "review_jobs.json"
+    jobs_data = _load_json_file(data_path, None)
+    if not isinstance(jobs_data, list):
+        existing = _load_json_file(summary_path, {})
+        if isinstance(existing, dict) and existing:
+            last_run = str(existing.get("last_run_at", ""))
+            try:
+                if now - parse_local_datetime(last_run) > timedelta(hours=24):
+                    existing["added_24h"] = 0
+            except (TypeError, ValueError):
+                existing["added_24h"] = 0
+            return existing
+        return {
+            "profile": profile, "last_run_at": "", "total": 0,
+            "added_24h": 0, "review_count": 0, "latest": [],
+        }
+    jobs, migrated_review = [], []
+    for raw_job in jobs_data:
+        job = finalize(dict(raw_job))
+        decision = classify_job(job)
+        if decision["destination"] == "main":
+            jobs.append(job)
+        elif decision["destination"] == "review":
+            migrated_review.append(job)
+    review_data = _load_json_file(review_path, [])
+    review_jobs = migrated_review
+    if isinstance(review_data, list):
+        for raw_job in review_data:
+            job = finalize(dict(raw_job))
+            destination = classify_job(job)["destination"]
+            if destination == "main":
+                jobs.append(job)
+            elif destination == "review":
+                review_jobs.append(job)
+    jobs = deduplicate_jobs(jobs)
+    strict_ids = {tracking_id(job) for job in jobs}
+    review_count = len([
+        job for job in deduplicate_jobs(review_jobs)
+        if tracking_id(job) not in strict_ids
+    ])
+    health, _coverage, _rejections = _profile_diagnostics(profile)
+    last_run = _profile_last_run(health)
+    if not last_run and data_path.exists():
+        last_run = datetime.fromtimestamp(
+            data_path.stat().st_mtime, LOCAL_TIMEZONE
+        ).isoformat()
+    added_24h = 0
+    for job in jobs:
+        try:
+            if now - parse_local_datetime(job.get("found_at", "")) <= timedelta(hours=24):
+                added_24h += 1
+        except (TypeError, ValueError):
+            pass
+    recent = sorted(jobs, key=lambda job: job.get("found_at", ""), reverse=True)
+    summary = {
+        "profile": profile, "last_run_at": last_run, "total": len(jobs),
+        "added_24h": added_24h, "review_count": review_count,
+        "latest": [
+            {"title": clean_job_title(job.get("title", "")),
+             "url": job.get("url", ""), "found_at": job.get("found_at", "")}
+            for job in recent[:3]
+        ],
+    }
+    _atomic_write_json(summary_path, summary, keep_backup=False)
+    return summary
+
+
+def generate_status_page(published_at: datetime | None = None,
+                         data_fresh_at: datetime | None = None):
     """Publie les signaux permettant d'identifier une perte de couverture."""
     published_at = published_at or local_now()
-    published_iso = published_at.isoformat()
+    data_fresh_at = data_fresh_at or published_at
+    published_iso = data_fresh_at.isoformat()
     published_label = published_at.strftime("%d/%m/%Y à %H:%M")
     status_labels = {
         "ok": "OK",
@@ -5900,19 +6345,9 @@ def generate_status_page(published_at: datetime | None = None):
     }
     sections = []
     for profile, cfg in PROFILES.items():
-        data_dir = DATA_ROOT / profile
-        health = _load_json_file(data_dir / "health.json", {})
-        coverage = _load_json_file(data_dir / "query_coverage.json", {})
-        rejections = _load_json_file(data_dir / "rejections.json", {})
-        health = health if isinstance(health, dict) else {}
-        coverage = coverage if isinstance(coverage, dict) else {}
-        rejections = rejections if isinstance(rejections, dict) else {}
+        health, coverage, rejections = _profile_diagnostics(profile)
         health_rows_data = []
-        latest_profile_run = max(
-            (str(entry.get("last_run_at") or entry.get("updated_at") or "")
-             for entry in health.values()),
-            default="",
-        )
+        latest_profile_run = _profile_last_run(health)
         for name, entry in sorted(health.items()):
             status = entry.get("last_status", "—")
             duration = entry.get("duration_ms")
@@ -5977,7 +6412,7 @@ def generate_status_page(published_at: datetime | None = None):
     html = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="État de couverture des sources de la veille emploi."><link rel="stylesheet" href="assets/site.css"><link rel="icon" href="icon.svg" type="image/svg+xml"><title>Couverture de la recherche</title></head>
 <body data-last-published="{escape(published_iso)}"><header class="site-header"><div class="shell header-inner"><a class="brand" href="./">Veille emploi</a>{_nav_html('status')}<div class="header-actions"><button id="theme-toggle" class="icon-button" type="button">◐</button></div></div></header>
-<main class="shell"><section class="hero"><div><p class="eyebrow">Diagnostic</p><h1>Couverture de la recherche</h1><p class="updated">Publication générée le {escape(published_label)}. Cette page permet de repérer une source cassée, une requête devenue muette ou un filtre trop strict.</p><p id="publication-warning" class="freshness-warning" hidden>⚠️ La dernière publication remonte à plus de 36 heures.</p></div></section>{''.join(sections)}</main>
+<main class="shell"><section class="hero"><div><p class="eyebrow">Diagnostic</p><h1>Couverture de la recherche</h1><p class="updated">Publication générée le {escape(published_label)}. Cette page permet de repérer une source cassée, une requête devenue muette ou un filtre trop strict.</p><p id="publication-warning" class="freshness-warning" hidden>⚠️ Au moins un profil n’a pas été actualisé depuis plus de 36 heures.</p></div></section>{''.join(sections)}</main>
 <script>document.getElementById('theme-toggle').addEventListener('click',()=>{{const d=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=d?'dark':'';localStorage.setItem('find-job:theme',d?'dark':'light')}});if(localStorage.getItem('find-job:theme')==='dark')document.documentElement.dataset.theme='dark';const stale=value=>{{const date=Date.parse(value);return !date||Date.now()-date>36*3600*1000}};if(stale(document.body.dataset.lastPublished))document.getElementById('publication-warning').hidden=false;document.querySelectorAll('.status-profile .freshness-warning').forEach(node=>{{if(stale(node.dataset.lastRun))node.hidden=false}});</script></body></html>"""
     _atomic_write_text(DOCS_ROOT / "status.html", html)
 
@@ -5986,45 +6421,58 @@ def generate_portal_index():
     """Tableau de bord des profils avec compteurs et dernières offres."""
     now = local_now()
     generate_site_assets()
-    generate_status_page(now)
+    summaries = {
+        profile: _profile_summary(profile, now) for profile in PROFILES
+    }
+    profile_dates = {}
+    for profile, summary in summaries.items():
+        try:
+            profile_dates[profile] = parse_local_datetime(summary.get("last_run_at", ""))
+        except (TypeError, ValueError):
+            pass
+    data_fresh_at = (
+        min(profile_dates.values())
+        if len(profile_dates) == len(PROFILES)
+        else datetime.fromtimestamp(0, LOCAL_TIMEZONE)
+    )
+    generate_status_page(now, data_fresh_at)
     _atomic_write_json(
         DOCS_ROOT / "publication.json",
-        {"last_published_at": now.isoformat()},
+        {
+            "schema_version": 2,
+            "generated_at": now.isoformat(),
+            "last_published_at": now.isoformat(),
+            "oldest_profile_at": data_fresh_at.isoformat(),
+            "profiles": {
+                profile: {
+                    "last_run_at": summary.get("last_run_at", ""),
+                    "total": summary.get("total", 0),
+                    "review_count": summary.get("review_count", 0),
+                }
+                for profile, summary in summaries.items()
+            },
+        },
+        keep_backup=False,
     )
     cards = []
     for profile, cfg in PROFILES.items():
-        path = DATA_ROOT / profile / "all_jobs.json"
-        jobs = _load_json_file(path, [])
-        if not isinstance(jobs, list):
-            jobs = []
-        jobs = deduplicate_jobs(jobs)
-        review_path = DATA_ROOT / profile / "review_jobs.json"
-        review_data = _load_json_file(review_path, [])
-        review_count = (
-            len(deduplicate_jobs(review_data)) if isinstance(review_data, list) else 0
-        )
-        recent = sorted(jobs, key=lambda job: job.get("found_at", ""), reverse=True)
-        added_24h = 0
-        for job in jobs:
-            try:
-                if now - parse_local_datetime(job.get("found_at", "")) <= timedelta(hours=24):
-                    added_24h += 1
-            except (TypeError, ValueError):
-                pass
+        summary = summaries[profile]
+        review_count = int(summary.get("review_count", 0) or 0)
+        added_24h = int(summary.get("added_24h", 0) or 0)
         latest = "".join(
             f'<li><a href="{escape(job.get("url", ""))}" target="_blank" rel="noopener noreferrer">'
             f'{escape(clean_job_title(job.get("title", "")))}</a></li>'
-            for job in recent[:3]
+            for job in summary.get("latest", [])[:3]
         ) or "<li>Aucune offre pour le moment.</li>"
-        updated = (
-            datetime.fromtimestamp(path.stat().st_mtime, LOCAL_TIMEZONE).strftime(
+        try:
+            updated = parse_local_datetime(summary.get("last_run_at", "")).strftime(
                 "%d/%m/%Y à %H:%M"
             )
-            if path.exists() else "jamais"
-        )
+        except (TypeError, ValueError):
+            updated = "jamais"
         cards.append(f"""<article class="profile-card">
 <p class="eyebrow">{escape(cfg['label'])}</p><h2><a href="{profile}/">{escape(cfg['title'])}</a></h2>
-<p>{escape(cfg['description'])}</p><div class="card-stats"><span><strong>{len(jobs)}</strong> offres</span>
+<p>{escape(cfg['description'])}</p><div class="card-stats"><span><strong>{int(summary.get('total', 0) or 0)}</strong> offres</span>
 <span><strong>{added_24h}</strong> ajoutées sur 24 h</span>
 <span><strong>{review_count}</strong> à vérifier</span></div>
 <div class="latest"><h3>Dernières offres</h3><ul>{latest}</ul></div>
@@ -6037,15 +6485,16 @@ def generate_portal_index():
 <meta property="og:title" content="Veilles emploi – Genève"><link rel="canonical" href="{escape(SITE_BASE_URL)}">
 <link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/site.css"><script>if(localStorage.getItem('find-job:theme')==='dark')document.documentElement.dataset.theme='dark';</script>
-<title>Veilles emploi – Genève</title></head><body><a class="skip-link" href="#profils">Aller aux profils</a>
+<title>Veilles emploi – Genève</title></head><body data-data-fresh-at="{escape(data_fresh_at.isoformat())}"><a class="skip-link" href="#profils">Aller aux profils</a>
 <header class="site-header"><div class="shell header-inner"><a class="brand" href="./">Veille emploi</a>{_nav_html('accueil')}
 <div class="header-actions"><button id="theme-toggle" class="icon-button" type="button" aria-label="Changer de thème">◐</button></div></div></header>
 <main class="shell"><section class="portal-hero"><p class="eyebrow">Recherche ciblée et actualisée</p>
 <h1>Vos veilles emploi à Genève</h1><p class="portal-intro">Trois sélections spécialisées, filtrées pour ne conserver que Genève et les communes proches du district de Nyon.</p>
+<p id="portal-freshness-warning" class="freshness-warning" hidden>⚠️ Au moins un profil n’a pas été actualisé depuis plus de 36 heures. Consultez la page Couverture.</p>
 <div class="coverage" aria-label="Zone couverte"><span>Canton de Genève</span><span>Nyon et communes proches</span><span>Offres francophones</span></div></section>
 <section id="profils" class="profile-grid" aria-label="Profils de recherche">{''.join(cards)}</section></main>
 <footer><div class="shell">Les compteurs sont actualisés lors de chaque recherche automatique.</div></footer>
-<script>document.getElementById('theme-toggle').addEventListener('click',()=>{{const d=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=d?'dark':'';localStorage.setItem('find-job:theme',d?'dark':'light')}});if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{{}}));</script>
+<script>document.getElementById('theme-toggle').addEventListener('click',()=>{{const d=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=d?'dark':'';localStorage.setItem('find-job:theme',d?'dark':'light')}});const fresh=Date.parse(document.body.dataset.dataFreshAt);if(!fresh||Date.now()-fresh>36*3600*1000)document.getElementById('portal-freshness-warning').hidden=false;if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{{}}));</script>
 </body></html>"""
     _atomic_write_text(DOCS_ROOT / "index.html", html)
 
@@ -6309,8 +6758,10 @@ def run_profile(profile: str):
     # Purge des liens morts : une offre dont la page renvoie 404/410 a été retirée
     # par la source et ne doit plus figurer dans le rapport (lien cassé).
     # Parallélisé (requêtes HEAD indépendantes) pour ne pas allonger le run.
-    before = len(all_jobs)
-    jobs_to_check = [job for job in all_jobs if dead_link_check_due(job)]
+    before_main, before_review = len(all_jobs), len(review_jobs)
+    jobs_to_check = [
+        job for job in all_jobs + review_jobs if dead_link_check_due(job)
+    ]
     with ThreadPoolExecutor(max_workers=8) as pool:
         dead_flags = list(pool.map(lambda j: url_is_dead(j["url"]), jobs_to_check))
     checked_at = local_now().isoformat()
@@ -6325,9 +6776,16 @@ def run_profile(profile: str):
         job for job in all_jobs
         if canonical_url(job.get("url", "")) not in dead_urls
     ]
-    dead = before - len(all_jobs)
+    review_jobs = [
+        job for job in review_jobs
+        if canonical_url(job.get("url", "")) not in dead_urls
+    ]
+    dead = (before_main - len(all_jobs)) + (before_review - len(review_jobs))
     if dead:
-        log(f"Liens morts : {dead} offre(s) retirée(s) (page 404/410)")
+        log(
+            f"Liens morts : {dead} offre(s) retirée(s), sélection et revue "
+            "confondues (GET confirmé en 404/410)"
+        )
 
     # Réconciliation `seen` ↔ archive : une offre sortie de `all_jobs` (fusion,
     # expiration, ré-validation, lien mort) ne doit PAS rester « déjà vue », sinon

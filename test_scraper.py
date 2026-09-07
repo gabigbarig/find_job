@@ -185,6 +185,24 @@ class RelevanceRegressionTests(unittest.TestCase):
                 self.assertEqual(geography["status"], "target")
                 self.assertEqual(geography["canton"], canton)
 
+    def test_swiss_canton_codes_reject_precise_locations_outside_target(self):
+        locations = {
+            "Cernier, NE, 2053, CH": "Neuchâtel",
+            "Avenches VD 1580": "Vaud",
+            "Martigny VS 1920": "Valais",
+            "Fehraltorf ZH 8320": "Zurich",
+            "Domat GR 7013": "Grisons",
+        }
+        for location, canton in locations.items():
+            with self.subTest(location=location):
+                geography = scraper.structured_geography(location)
+                self.assertEqual(geography["status"], "outside")
+                self.assertEqual(geography["country"], "Suisse")
+                self.assertEqual(geography["canton"], canton)
+        self.assertEqual(
+            scraper.structured_geography("1260 Nyon, VD")["status"], "target"
+        )
+
     def test_final_foreign_iso_country_code_is_outside(self):
         geography = scraper.structured_geography("Houston, TX, us")
         self.assertEqual(geography["status"], "outside")
@@ -343,6 +361,49 @@ class RelevanceRegressionTests(unittest.TestCase):
             "Un (e) Comptable junior",
         )
         self.assertFalse(scraper.is_french_text("Senior Site Reliability Engineer Hosting Plattformen"))
+        noisy_titles = {
+            "Enseignant(e) français cycle 14 juil.": "Enseignant(e) français cycle",
+            "Responsable éditorial Détails du poste | Aéroport": "Responsable éditorial",
+            "?Accountant General Ledger (m/f/d)": "Accountant General Ledger (m/f/d)",
+            "L’année dernière Manager Accounting": "Manager Accounting",
+        }
+        for raw, expected in noisy_titles.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(scraper.clean_job_title(raw), expected)
+
+    def test_systemes_rejects_product_systems_and_a_german_title(self):
+        for title in (
+            "FPGA System Engineer - Quantum Microscopy",
+            "Systems Engineer Risks and Safety Standards",
+            "Senior Java Platform Engineer",
+            "Techniker / System Engineer im Bereich IT/OT (m/w) 100%",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(classify("systemes", title), "reject")
+
+    def test_unige_job_document_is_rejected_from_existing_archive(self):
+        scraper.configure_profile("comptabilite")
+        job = scraper.finalize({
+            "title": "Cahier des charges magasinier(ère)-comptable.pdf",
+            "url": "https://jobs.unige.ch/www/wd_portal.view_blob?p_type=JOBDOC",
+            "company": "Université de Genève", "location": "Genève",
+            "source": "jobs.unige.ch",
+        })
+        self.assertEqual(scraper.classify_job(job)["destination"], "reject")
+
+    def test_fit_tier_improves_order_without_filtering_adjacent_roles(self):
+        scraper.configure_profile("lettres")
+        core = scraper.finalize({
+            "title": "Bibliothécaire documentaliste", "location": "Genève",
+            "company": "Bibliothèque test", "source": "source directe",
+        })
+        adjacent = scraper.finalize({
+            "title": "Communications Manager", "location": "Genève",
+            "company": "Organisation test", "source": "source directe",
+        })
+        self.assertEqual(core["fit_tier"], "core")
+        self.assertEqual(adjacent["fit_tier"], "adjacent")
+        self.assertGreater(core["rank_score"], adjacent["rank_score"])
 
     def test_german_description_is_rejected_even_with_english_title(self):
         german_description = (
@@ -507,6 +568,7 @@ class ParserFixtureTests(unittest.TestCase):
         self.assertEqual(len(offers), 1)
         self.assertEqual(offers[0]["title"], "Administrateur Système Linux")
         self.assertEqual(offers[0]["location"], "Genève")
+        self.assertEqual(offers[0]["company"], "Entreprise Exemple")
 
     def test_jobscout24_never_invents_geneva_for_an_unknown_place(self):
         html = """
@@ -530,12 +592,14 @@ class ParserFixtureTests(unittest.TestCase):
         self.assertEqual(len(offers), 1)
         self.assertEqual(offers[0]["title"], "Bibliothécaire documentaliste")
         self.assertEqual(offers[0]["location"], "Genève")
+        self.assertEqual(offers[0]["company"], "Bibliothèque Exemple")
 
     def test_jobs_ch_fixture(self):
         offers = scraper._parse_jobs_ch_page(fixture_text("jobs_ch.html"))
         self.assertEqual(len(offers), 1)
         self.assertEqual(offers[0]["title"], "Administrateur Système Linux")
         self.assertEqual(offers[0]["location"], "Meyrin")
+        self.assertEqual(offers[0]["company"], "Infrastructure Genève SA")
 
     def test_educh_fixture(self):
         offers = scraper._parse_educh_page(fixture_text("educh.html"))
@@ -613,6 +677,29 @@ class ParserFixtureTests(unittest.TestCase):
         self.assertEqual(offers[0]["location"], "GENEVA")
         self.assertEqual(offers[0]["company"], "United Nations Office at Geneva")
 
+    def test_unige_ignores_pdf_job_documents(self):
+        soup = scraper.BeautifulSoup(
+            """
+            <table>
+              <tr><td><a href="wd_portal.view_blob?p_type=JOBDOC">
+                Cahier des charges magasinier(ère)-comptable.pdf
+              </a></td></tr>
+              <tr><td><a href="wd_portal.show_job?p_web_site_id=1&p_web_page_id=42">
+                Comptable
+              </a></td></tr>
+            </table>
+            """,
+            "lxml",
+        )
+        def retain(title, url, fields, jobs, seen):
+            jobs.append({"title": title, "url": url, **fields})
+
+        with patch.object(scraper, "fetch", return_value=soup), \
+                patch.object(scraper, "consider", side_effect=retain) as consider:
+            scraper.scrape_unige()
+        self.assertEqual(consider.call_count, 1)
+        self.assertEqual(consider.call_args.args[0], "Comptable")
+
     def test_institutional_heading_cards_fixture(self):
         offers = scraper._parse_heading_job_cards(
             fixture_text("institution_jobs.html"), "https://www.ecolint.ch/fr/emploi"
@@ -684,6 +771,16 @@ class ReliabilityTests(unittest.TestCase):
             self.assertTrue(scraper.dead_link_check_due({
                 "url_checked_at": (now - scraper.timedelta(hours=25)).isoformat(),
             }))
+
+    def test_dead_link_requires_get_confirmation_after_head_404(self):
+        http = Mock()
+        http.head.return_value = Mock(status_code=404)
+        http.get.return_value = Mock(status_code=200)
+        with patch.object(scraper, "host_resolves", return_value=True), \
+                patch.object(scraper, "_polite_wait"), \
+                patch.object(scraper, "session", return_value=http):
+            self.assertFalse(scraper.url_is_dead("https://example.test/job/42"))
+        http.get.assert_called_once()
 
     def test_valid_through_expires_an_offer_even_if_recently_found(self):
         now = scraper.local_now()
@@ -1015,7 +1112,44 @@ class ReliabilityTests(unittest.TestCase):
                 scraper.generate_status_page(published_at)
             html = (root / "docs" / "status.html").read_text(encoding="utf-8")
         self.assertIn('data-last-published="2026-08-28T12:30:00+02:00"', html)
-        self.assertIn("dernière publication remonte à plus de 36 heures", html)
+        self.assertIn("profil n’a pas été actualisé depuis plus de 36 heures", html)
+
+    def test_portal_records_the_oldest_profile_and_resilient_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root, docs_root = root / "data", root / "docs"
+            now = scraper.datetime(
+                2026, 9, 7, 12, 0, tzinfo=scraper.LOCAL_TIMEZONE
+            )
+            runs = {
+                "lettres": "2026-09-07T11:00:00+02:00",
+                "comptabilite": "2026-09-07T10:00:00+02:00",
+                "systemes": "2026-09-06T09:00:00+02:00",
+            }
+            for profile, last_run in runs.items():
+                profile_dir = data_root / profile
+                profile_dir.mkdir(parents=True)
+                (profile_dir / "all_jobs.json").write_text("[]", encoding="utf-8")
+                (profile_dir / "review_jobs.json").write_text("[]", encoding="utf-8")
+                (profile_dir / "health.json").write_text(
+                    json.dumps({"source": {"last_run_at": last_run}}),
+                    encoding="utf-8",
+                )
+            with patch.object(scraper, "DATA_ROOT", data_root), \
+                    patch.object(scraper, "DOCS_ROOT", docs_root), \
+                    patch.object(scraper, "local_now", return_value=now):
+                scraper.generate_portal_index()
+            publication = json.loads(
+                (docs_root / "publication.json").read_text(encoding="utf-8")
+            )
+            index = (docs_root / "index.html").read_text(encoding="utf-8")
+            service_worker = (docs_root / "sw.js").read_text(encoding="utf-8")
+        self.assertEqual(
+            publication["oldest_profile_at"], "2026-09-06T09:00:00+02:00"
+        )
+        self.assertIn('data-data-fresh-at="2026-09-06T09:00:00+02:00"', index)
+        self.assertIn("Promise.all(FILES.map", service_worker)
+        self.assertIn("find-job-v3", service_worker)
 
     def test_detail_cache_survives_a_new_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1208,6 +1342,26 @@ class IdentityTests(unittest.TestCase):
             },
         ]
         self.assertEqual(len(scraper.deduplicate_jobs(jobs)), 1)
+
+    def test_cross_source_variant_keeps_the_direct_richer_record(self):
+        jobs = [
+            {
+                "title": "Responsable éditorial", "company": "Genève Aéroport",
+                "source": "jobs.ch", "external_id": "BOARD-42",
+                "url": "https://www.jobs.ch/fr/detail/42",
+            },
+            {
+                "title": "Editorial Manager",
+                "company": "Aéroport International de Genève SA",
+                "source": "carriere.gva.ch", "external_id": "REQ-2026-42",
+                "url": "https://carriere.gva.ch/job/REQ-2026-42",
+                "description": "Description officielle et détaillée du poste.",
+            },
+        ]
+        result = scraper.deduplicate_jobs(jobs)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["source"], "carriere.gva.ch")
+        self.assertIn("jobs.ch", result[0]["alternate_sources"])
 
 
 if __name__ == "__main__":

@@ -18,13 +18,10 @@ fi
 FIND_JOB_LOCK_HELD=1 "$VENV" scraper.py --profile "$PROFILE"
 
 if [ "$PROFILE" = "all" ]; then
-  git add docs/index.html docs/status.html docs/assets docs/icon.svg docs/manifest.webmanifest docs/sw.js \
-          docs/lettres/index.html docs/lettres/feed.xml \
-          docs/comptabilite/index.html docs/comptabilite/feed.xml \
-          docs/systemes/index.html docs/systemes/feed.xml
+  git add docs
 else
-  git add docs/index.html docs/status.html docs/assets docs/icon.svg docs/manifest.webmanifest docs/sw.js \
-          "docs/$PROFILE/index.html" "docs/$PROFILE/feed.xml"
+  git add docs/index.html docs/status.html docs/publication.json docs/assets \
+          docs/icon.svg docs/manifest.webmanifest docs/sw.js "docs/$PROFILE"
 fi
 
 if git diff --cached --quiet; then

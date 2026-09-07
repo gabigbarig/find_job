@@ -1,0 +1,67 @@
+name: Surveiller la publication
+
+on:
+  schedule:
+    - cron: "43 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+      - name: Vérifier la fraîcheur des rapports
+        shell: python
+        run: |
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          path = Path("docs/publication.json")
+          errors = []
+          try:
+              publication = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              publication = {}
+              errors.append(f"Métadonnées de publication illisibles : {exc}")
+
+          def age_hours(value):
+              parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+              if parsed.tzinfo is None:
+                  parsed = parsed.replace(tzinfo=timezone.utc)
+              return (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 3600
+
+          generated = publication.get("generated_at") or publication.get("last_published_at")
+          oldest_profile = publication.get("oldest_profile_at") or generated
+          for label, value in (
+              ("dernière publication", generated),
+              ("profil le moins récent", oldest_profile),
+          ):
+              try:
+                  age = age_hours(value)
+              except (TypeError, ValueError):
+                  errors.append(f"Date absente ou invalide pour {label}.")
+                  continue
+              if age > 36:
+                  errors.append(f"{label.capitalize()} : {age:.1f} h (> 36 h).")
+
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          if errors:
+              summary.write_text(
+                  "## Publication trop ancienne\n\n" +
+                  "\n".join(f"- {error}" for error in errors) + "\n",
+                  encoding="utf-8",
+              )
+              print("\n".join(errors), file=sys.stderr)
+              raise SystemExit(1)
+          summary.write_text(
+              "## Publication saine\n\nLes rapports et les trois profils ont moins de 36 heures.\n",
+              encoding="utf-8",
+          )
