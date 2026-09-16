@@ -48,7 +48,9 @@ from email.mime.text import MIMEText
 from html import escape
 from pathlib import Path
 from typing import Callable, Literal, TypedDict
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urljoin, urlunparse
+from urllib.parse import (
+    parse_qsl, quote, unquote, urlencode, urlparse, urljoin, urlunparse,
+)
 from zoneinfo import ZoneInfo
 
 import requests
@@ -2671,6 +2673,7 @@ GEO_FOREIGN_COUNTRIES = [
     "tunisia", "sénégal", "senegal", "chine", "china", "japon", "japan",
     "singapour", "singapore", "inde", "india", "australie", "australia",
     "brésil", "bresil", "brazil", "mexique", "mexico",
+    "luxembourg", "liechtenstein",
 ]
 GEO_FOREIGN_CITIES = [
     "annemasse", "lyon", "paris", "lille", "grenoble", "chambéry", "chambery",
@@ -2681,6 +2684,7 @@ GEO_FOREIGN_CITIES = [
     "toronto", "rabat", "casablanca", "tunis", "dakar", "shanghai", "pékin",
     "pekin", "beijing", "tokyo", "osaka", "delhi", "mumbai", "sydney",
     "schaan", "vaduz",
+    "luxembourg",
 ]
 GEO_SWISS_CANTONS = {
     "aargau": "Argovie", "argovie": "Argovie",
@@ -2852,15 +2856,57 @@ def structured_geography(text: str) -> dict:
     }
 
 
+_LOCATION_PLACEHOLDER_RE = re.compile(
+    r"^(?:"
+    r"[-—?]|n/?a|inconnu|unknown|non (?:precise|specifie)|not specified|"
+    r"a confirmer|(?:plusieurs|multiple|several) (?:sites?|lieux|locations?)|"
+    r"\d+ (?:sites?|lieux|locations?)|remote|teletravail|home office|"
+    r"hybride?|hybrid|sur site|on[ -]?site"
+    r")$"
+)
+
+
+def explicit_location_without_target(text: str) -> bool:
+    """Vrai pour un champ lieu explicite qui ne prouve pas la zone cible.
+
+    Une ville extraite telle que « Prilly » ou « Winterthour » n'est pas un
+    lieu inconnu : même si elle n'est pas dans notre petit registre de villes
+    hors zone, elle prouve que l'offre n'est pas à Genève/Nyon. Les valeurs de
+    remplacement et les libellés multi-sites restent en revanche indéterminés.
+    """
+    raw = re.sub(r"\s+", " ", str(text or "")).strip(" ,;:")
+    norm = normalize(raw)
+    if not norm or _LOCATION_PLACEHOLDER_RE.fullmatch(norm):
+        return False
+    if len(raw) > 140 or len(raw.split()) > 12:
+        # Certains adaptateurs placent temporairement tout le texte d'une carte
+        # dans ce champ. Sans indice géographique reconnu, ce n'est pas une ville.
+        return False
+    return structured_geography(raw)["status"] != "target"
+
+
 def job_geography(job: dict) -> dict:
     """Décision géographique priorisant le champ lieu sur le texte de la fiche."""
     location = str(job.get("location", "") or "")
     location_geo = structured_geography(location)
     if location_geo["status"] != "unknown":
         return location_geo
+    if explicit_location_without_target(location):
+        return {
+            "status": "outside", "country": "", "canton": "",
+            "city": location.strip(), "postal_code": None,
+            "evidence": location.strip(),
+        }
     title_geo = structured_geography(job.get("title", ""))
     if title_geo["status"] != "unknown":
         return title_geo
+    # Certains ATS remplacent le lieu par « 2 sites » alors que leur URL
+    # conserve une ville explicite (p. ex. /job/Luxembourg/...). On n'utilise
+    # l'URL que comme preuve négative : elle ne suffit jamais à inventer Genève.
+    url_path = unquote(urlparse(str(job.get("url", "") or "")).path)
+    url_geo = structured_geography(url_path.replace("-", " ").replace("_", " "))
+    if url_geo["status"] == "outside":
+        return url_geo
     # Sans champ lieu exploitable, ne lire que le lieu explicitement étiqueté
     # dans la description. Les simples mentions de pays (clients, missions,
     # voyages) ne doivent pas transformer une offre locale en offre étrangère.

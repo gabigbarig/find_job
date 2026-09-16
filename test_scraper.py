@@ -154,6 +154,40 @@ class RelevanceRegressionTests(unittest.TestCase):
                     "reject",
                 )
 
+    def test_unlisted_swiss_cities_are_not_treated_as_unknown(self):
+        for location in (
+            "Prilly", "Winterthour", "Wiler b. Seedorf", "Baar ZG",
+            "Region Ostschweiz",
+        ):
+            with self.subTest(location=location):
+                self.assertEqual(
+                    classify(
+                        "systemes", "Ingénieur Système Linux",
+                        location=location,
+                    ),
+                    "reject",
+                )
+
+    def test_truly_missing_location_can_still_be_reviewed(self):
+        self.assertEqual(
+            classify("systemes", "Ingénieur Système Linux", location=""),
+            "review",
+        )
+
+    def test_multisite_placeholder_uses_explicit_foreign_city_in_url(self):
+        scraper.configure_profile("systemes")
+        job = scraper.finalize({
+            "title": "Systems Engineer Automation Windows VMware",
+            "description": "",
+            "location": "2 sites",
+            "url": (
+                "https://example.test/job/Luxembourg/"
+                "Systems-Engineer-Automation"
+            ),
+            "source": "test",
+        })
+        self.assertEqual(scraper.classify_job(job)["destination"], "reject")
+
     def test_structured_geography_exposes_country_canton_and_city(self):
         local = scraper.structured_geography("Meyrin, Genève, Suisse")
         self.assertEqual(local["status"], "target")
