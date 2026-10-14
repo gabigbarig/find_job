@@ -2,120 +2,120 @@
   "health": {
     "ge_ch": {
       "last": 2,
-      "updated_at": "2026-10-14T00:46:56.389457+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389457+02:00",
+      "updated_at": "2026-10-14T13:51:14.413394+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413394+02:00",
       "last_status": "ok",
-      "duration_ms": 826,
+      "duration_ms": 829,
       "source_field": "ge.ch",
-      "raw_last": 69,
-      "last_healthy_at": "2026-10-14T00:46:56.389457+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389457+02:00",
+      "raw_last": 72,
+      "last_healthy_at": "2026-10-14T13:51:14.413394+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413394+02:00",
       "main_last": 1,
       "review_last": 1,
       "unique_last": 2
     },
     "museums": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389490+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389490+02:00",
+      "updated_at": "2026-10-14T13:51:14.413429+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413429+02:00",
       "last_status": "filtered",
-      "duration_ms": 1297,
+      "duration_ms": 1198,
       "source_field": "museums.ch",
       "raw_last": 20,
-      "last_healthy_at": "2026-10-14T00:46:56.389490+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389490+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413429+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413429+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ville_geneve": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389479+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389479+02:00",
+      "updated_at": "2026-10-14T13:51:14.413417+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413417+02:00",
       "last_status": "filtered",
-      "duration_ms": 868,
+      "duration_ms": 1048,
       "source_field": "geneve.ch",
       "raw_last": 9,
-      "last_healthy_at": "2026-10-14T00:46:56.389479+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389479+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413417+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413417+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "vaud": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389520+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389520+02:00",
+      "updated_at": "2026-10-14T13:51:14.413444+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413444+02:00",
       "last_status": "filtered",
-      "duration_ms": 2635,
+      "duration_ms": 2029,
       "source_field": "offres-emploi.vd.ch",
-      "raw_last": 93,
-      "last_healthy_at": "2026-10-14T00:46:56.389520+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389520+02:00",
+      "raw_last": 96,
+      "last_healthy_at": "2026-10-14T13:51:14.413444+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413444+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ville_nyon": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389506+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389506+02:00",
+      "updated_at": "2026-10-14T13:51:14.413457+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413457+02:00",
       "last_status": "filtered",
-      "duration_ms": 2126,
+      "duration_ms": 2483,
       "source_field": "nyon.ch",
       "raw_last": 21,
-      "last_healthy_at": "2026-10-14T00:46:56.389506+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389506+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413457+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413457+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "unige": {
       "last": 1,
-      "updated_at": "2026-10-14T00:46:56.389499+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389499+02:00",
+      "updated_at": "2026-10-14T13:51:14.413437+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413437+02:00",
       "last_status": "ok",
-      "duration_ms": 1621,
+      "duration_ms": 2015,
       "source_field": "jobs.unige.ch",
       "raw_last": 86,
-      "last_healthy_at": "2026-10-14T00:46:56.389499+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389499+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413437+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413437+02:00",
       "main_last": 1,
       "review_last": 0,
       "unique_last": 1
     },
     "ecolint": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389513+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389513+02:00",
+      "updated_at": "2026-10-14T13:51:14.413452+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413452+02:00",
       "last_status": "filtered",
-      "duration_ms": 848,
+      "duration_ms": 1122,
       "source_field": "ecolint.ch",
-      "raw_last": 1,
-      "last_healthy_at": "2026-10-14T00:46:56.389513+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389513+02:00",
+      "raw_last": 2,
+      "last_healthy_at": "2026-10-14T13:51:14.413452+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413452+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "letemps": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389545+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389545+02:00",
+      "updated_at": "2026-10-14T13:51:14.413463+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413463+02:00",
       "last_status": "filtered",
-      "duration_ms": 1175,
+      "duration_ms": 774,
       "source_field": "Le Temps Emploi",
       "raw_last": 10,
-      "last_healthy_at": "2026-10-14T00:46:56.389545+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389545+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413463+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413463+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "adzuna": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389531+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389531+02:00",
+      "updated_at": "2026-10-14T13:51:14.413469+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413469+02:00",
       "last_status": "disabled",
       "duration_ms": 0,
       "last_error": "Adzuna : identifiants absents (ADZUNA_ID/ADZUNA_KEY) — source ignorée",
@@ -126,8 +126,8 @@
     },
     "linkedin_alert_emails": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389538+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389538+02:00",
+      "updated_at": "2026-10-14T13:51:14.413476+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413476+02:00",
       "last_status": "disabled",
       "duration_ms": 0,
       "last_error": "Alertes LinkedIn par email : configuration absente — source ignorée",
@@ -139,80 +139,80 @@
     },
     "bibliosuisse": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389525+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389525+02:00",
+      "updated_at": "2026-10-14T13:51:14.413483+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413483+02:00",
       "last_status": "filtered",
-      "duration_ms": 1201,
+      "duration_ms": 1548,
       "source_field": "bibliosuisse.ch",
       "raw_last": 3,
-      "last_healthy_at": "2026-10-14T00:46:56.389525+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389525+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413483+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413483+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "educh": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389551+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389551+02:00",
+      "updated_at": "2026-10-14T13:51:14.413489+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413489+02:00",
       "last_status": "filtered",
-      "duration_ms": 2886,
+      "duration_ms": 2919,
       "source_field": "educh.ch",
-      "raw_last": 78,
-      "last_healthy_at": "2026-10-14T00:46:56.389551+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389551+02:00",
+      "raw_last": 84,
+      "last_healthy_at": "2026-10-14T13:51:14.413489+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413489+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "cern": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389557+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389557+02:00",
+      "updated_at": "2026-10-14T13:51:14.413495+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413495+02:00",
       "last_status": "filtered",
-      "duration_ms": 1104,
+      "duration_ms": 1288,
       "source_field": "careers.cern",
-      "raw_last": 85,
-      "last_healthy_at": "2026-10-14T00:46:56.389557+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389557+02:00",
+      "raw_last": 86,
+      "last_healthy_at": "2026-10-14T13:51:14.413495+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413495+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "icrc": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389562+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389562+02:00",
+      "updated_at": "2026-10-14T13:51:14.413500+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413500+02:00",
       "last_status": "filtered",
-      "duration_ms": 1293,
+      "duration_ms": 1291,
       "source_field": "careers.icrc.org",
-      "raw_last": 12,
-      "last_healthy_at": "2026-10-14T00:46:56.389562+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389562+02:00",
+      "raw_last": 18,
+      "last_healthy_at": "2026-10-14T13:51:14.413500+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413500+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "unicef": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389568+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389568+02:00",
+      "updated_at": "2026-10-14T13:51:14.413570+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413570+02:00",
       "last_status": "filtered",
-      "duration_ms": 1162,
+      "duration_ms": 8262,
       "source_field": "jobs.unicef.org",
       "raw_last": 4,
-      "last_healthy_at": "2026-10-14T00:46:56.389568+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389568+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413570+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413570+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "wipo": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389592+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389592+02:00",
+      "updated_at": "2026-10-14T13:51:14.413539+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413539+02:00",
       "last_status": "empty",
-      "duration_ms": 5483,
+      "duration_ms": 5455,
       "source_field": "wipo.taleo.net",
       "raw_last": 0,
       "main_last": 0,
@@ -221,22 +221,22 @@
     },
     "sig": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389574+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389574+02:00",
+      "updated_at": "2026-10-14T13:51:14.413559+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413559+02:00",
       "last_status": "filtered",
-      "duration_ms": 2204,
+      "duration_ms": 2141,
       "source_field": "jobs.sig-ge.ch",
       "raw_last": 26,
-      "last_healthy_at": "2026-10-14T00:46:56.389574+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389574+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413559+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413559+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "reliefweb": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389585+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389585+02:00",
+      "updated_at": "2026-10-14T13:51:14.413552+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413552+02:00",
       "last_status": "disabled",
       "duration_ms": 0,
       "last_error": "ReliefWeb : RELIEFWEB_APPNAME pré-approuvé absent — source ignorée",
@@ -248,94 +248,94 @@
     },
     "wto": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389580+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389580+02:00",
+      "updated_at": "2026-10-14T13:51:14.413546+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413546+02:00",
       "last_status": "filtered",
-      "duration_ms": 785,
+      "duration_ms": 811,
       "source_field": "wto.org",
       "raw_last": 2,
-      "last_healthy_at": "2026-10-14T00:46:56.389580+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389580+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413546+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413546+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "configured_ats": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389600+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389600+02:00",
+      "updated_at": "2026-10-14T13:51:14.413506+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413506+02:00",
       "last_status": "filtered",
-      "duration_ms": 7532,
+      "duration_ms": 7432,
       "source_field": "Portails ATS directs",
       "raw_last": 194,
-      "last_healthy_at": "2026-10-14T00:46:56.389600+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389600+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413506+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413506+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ats_lombard odier": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389606+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389606+02:00",
+      "updated_at": "2026-10-14T13:51:14.413512+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413512+02:00",
       "last_status": "filtered",
-      "duration_ms": 1720,
+      "duration_ms": 1584,
       "source_field": "careers.lombardodier.com",
       "raw_last": 40,
-      "last_healthy_at": "2026-10-14T00:46:56.389606+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389606+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413512+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413512+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ats_vitol": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389611+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389611+02:00",
+      "updated_at": "2026-10-14T13:51:14.413517+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413517+02:00",
       "last_status": "filtered",
-      "duration_ms": 526,
+      "duration_ms": 677,
       "source_field": "careers.vitol.com",
       "raw_last": 34,
-      "last_healthy_at": "2026-10-14T00:46:56.389611+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389611+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413517+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413517+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ats_hopitaux universitaires de geneve": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389616+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389616+02:00",
+      "updated_at": "2026-10-14T13:51:14.413523+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413523+02:00",
       "last_status": "filtered",
-      "duration_ms": 897,
+      "duration_ms": 741,
       "source_field": "careers.hug.ch",
       "raw_last": 50,
-      "last_healthy_at": "2026-10-14T00:46:56.389616+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389616+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413523+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413523+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ats_union internationale des telecommunications": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389621+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389621+02:00",
+      "updated_at": "2026-10-14T13:51:14.413528+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413528+02:00",
       "last_status": "filtered",
-      "duration_ms": 2303,
+      "duration_ms": 2306,
       "source_field": "jobs.itu.int",
       "raw_last": 70,
-      "last_healthy_at": "2026-10-14T00:46:56.389621+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389621+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413528+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413528+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "ats_organisation internationale du travail": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389626+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389626+02:00",
+      "updated_at": "2026-10-14T13:51:14.413532+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413532+02:00",
       "last_status": "empty",
-      "duration_ms": 2084,
+      "duration_ms": 2124,
       "source_field": "jobs.ilo.org",
       "raw_last": 0,
       "main_last": 0,
@@ -344,75 +344,76 @@
     },
     "cinfo": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389632+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389632+02:00",
+      "updated_at": "2026-10-14T13:51:14.413565+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413565+02:00",
       "last_status": "filtered",
-      "duration_ms": 2058,
+      "duration_ms": 2180,
       "source_field": "cinfo.ch",
       "raw_last": 102,
-      "last_healthy_at": "2026-10-14T00:46:56.389632+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389632+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413565+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413565+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "educa": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389638+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389638+02:00",
+      "updated_at": "2026-10-14T13:51:14.413576+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413576+02:00",
       "last_status": "filtered",
-      "duration_ms": 23425,
+      "duration_ms": 24530,
       "source_field": "recrutement.hesge.ch",
       "raw_last": 6,
-      "last_healthy_at": "2026-10-14T00:46:56.389638+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389638+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413576+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413576+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "jobscout24": {
       "last": 18,
-      "updated_at": "2026-10-14T00:46:56.389645+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389645+02:00",
+      "updated_at": "2026-10-14T13:51:14.413583+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413583+02:00",
       "last_status": "ok",
-      "duration_ms": 36065,
+      "duration_ms": 35711,
       "source_field": "jobscout24.ch",
-      "raw_last": 302,
-      "last_healthy_at": "2026-10-14T00:46:56.389645+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389645+02:00",
+      "raw_last": 311,
+      "last_healthy_at": "2026-10-14T13:51:14.413583+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413583+02:00",
       "main_last": 17,
       "review_last": 1,
       "unique_last": 8
     },
     "jobup": {
-      "last": 41,
-      "updated_at": "2026-10-14T00:46:56.389652+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389652+02:00",
+      "last": 43,
+      "updated_at": "2026-10-14T13:51:14.413591+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413591+02:00",
       "last_status": "ok",
-      "duration_ms": 37417,
+      "duration_ms": 38398,
       "source_field": "jobup.ch",
-      "raw_last": 636,
-      "last_healthy_at": "2026-10-14T00:46:56.389652+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389652+02:00",
+      "raw_last": 635,
+      "last_healthy_at": "2026-10-14T13:51:14.413591+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413591+02:00",
       "main_last": 41,
-      "review_last": 0,
-      "unique_last": 26
+      "review_last": 2,
+      "unique_last": 28
     },
     "myscience": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389659+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389659+02:00",
-      "last_status": "empty",
-      "duration_ms": 75880,
+      "updated_at": "2026-10-14T13:51:14.413597+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413597+02:00",
+      "last_status": "warning",
+      "duration_ms": 8658,
       "source_field": "myscience.ch",
       "main_last": 0,
       "review_last": 0,
-      "unique_last": 0
+      "unique_last": 0,
+      "last_error": "Erreur Playwright www.myscience.ch : Page.goto: net::ERR_CERT_DATE_INVALID at https://www.myscience.ch/fr/jobs/Media | Erreur Playwright www.myscience.ch : Page.goto: net::ERR_CERT_DATE_INVALID at https://www.myscience.ch/fr/jobs/Philosophy | Erreur Playwright www.myscience.ch : Page.goto: net::ERR_CERT_DATE_INVALID at https://www.myscience.ch/fr/jobs/Social+Sciences"
     },
     "indeed_pw": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389666+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389666+02:00",
+      "updated_at": "2026-10-14T13:51:14.413605+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413605+02:00",
       "last_status": "disabled",
       "duration_ms": 0,
       "source_field": "Indeed CH",
@@ -423,24 +424,24 @@
     },
     "jobs_ch_pw": {
       "last": 23,
-      "updated_at": "2026-10-14T00:46:56.389673+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389673+02:00",
+      "updated_at": "2026-10-14T13:51:14.413611+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413611+02:00",
       "last_status": "ok",
-      "duration_ms": 56347,
+      "duration_ms": 56613,
       "source_field": "jobs.ch",
-      "raw_last": 372,
-      "last_healthy_at": "2026-10-14T00:46:56.389673+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389673+02:00",
+      "raw_last": 374,
+      "last_healthy_at": "2026-10-14T13:51:14.413611+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413611+02:00",
       "main_last": 21,
       "review_last": 2,
-      "unique_last": 11
+      "unique_last": 12
     },
     "who": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389679+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389679+02:00",
+      "updated_at": "2026-10-14T13:51:14.413618+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413618+02:00",
       "last_status": "empty",
-      "duration_ms": 1142,
+      "duration_ms": 1302,
       "source_field": "careers.who.int",
       "raw_last": 0,
       "main_last": 0,
@@ -449,24 +450,24 @@
     },
     "pictet": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389686+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389686+02:00",
+      "updated_at": "2026-10-14T13:51:14.413625+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413625+02:00",
       "last_status": "filtered",
-      "duration_ms": 3743,
+      "duration_ms": 3919,
       "source_field": "careers.pictet.com",
-      "raw_last": 6,
-      "last_healthy_at": "2026-10-14T00:46:56.389686+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389686+02:00",
+      "raw_last": 7,
+      "last_healthy_at": "2026-10-14T13:51:14.413625+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413625+02:00",
       "main_last": 0,
       "review_last": 0,
       "unique_last": 0
     },
     "tpg": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389693+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389693+02:00",
+      "updated_at": "2026-10-14T13:51:14.413632+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413632+02:00",
       "last_status": "disabled",
-      "duration_ms": 1186,
+      "duration_ms": 1396,
       "source_field": "tpg.ch",
       "raw_last": 0,
       "main_last": 0,
@@ -476,10 +477,10 @@
     },
     "un_geneva": {
       "last": 0,
-      "updated_at": "2026-10-14T00:46:56.389698+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389698+02:00",
+      "updated_at": "2026-10-14T13:51:14.413638+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413638+02:00",
       "last_status": "empty",
-      "duration_ms": 1231,
+      "duration_ms": 1216,
       "source_field": "careers.un.org",
       "raw_last": 0,
       "main_last": 0,
@@ -488,15 +489,15 @@
     },
     "cagi": {
       "last": 1,
-      "updated_at": "2026-10-14T00:46:56.389705+02:00",
-      "last_run_at": "2026-10-14T00:46:56.389705+02:00",
+      "updated_at": "2026-10-14T13:51:14.413644+02:00",
+      "last_run_at": "2026-10-14T13:51:14.413644+02:00",
       "last_status": "warning",
-      "duration_ms": 4720,
+      "duration_ms": 4598,
       "last_error": "Erreur fetch https://jobs.cagi.ch/fr/offres-demploi/ (définitive, pas de retry): 403 Client Error: Forbidden for url: https://jobs.cagi.ch/fr/offres-demploi/ | Erreur fetch https://jobs.cagi.ch/fr/offres-demploi/page/2/ (définitive, pas de retry): 403 Client Error: Forbidden for url: https://jobs.cagi.ch/fr/offres-demploi/page/2/ | Erreur fetch https://jobs.cagi.ch/fr/offres-demploi/page/3/ (définitive, pas de retry): 403 Client Error: Forbidden for url: https://jobs.cagi.ch/fr/offres-demploi/pa",
       "source_field": "jobs.cagi.ch",
       "raw_last": 10,
-      "last_healthy_at": "2026-10-14T00:46:56.389705+02:00",
-      "last_success_at": "2026-10-14T00:46:56.389705+02:00",
+      "last_healthy_at": "2026-10-14T13:51:14.413644+02:00",
+      "last_success_at": "2026-10-14T13:51:14.413644+02:00",
       "main_last": 1,
       "review_last": 0,
       "unique_last": 1
@@ -584,7 +585,7 @@
       "max": 22
     },
     "jobs.ch::payroll": {
-      "last": 5,
+      "last": 7,
       "zero_runs": 0,
       "max": 20
     },
@@ -599,17 +600,17 @@
       "max": 20
     },
     "jobscout24.ch::accountant": {
-      "last": 20,
+      "last": 21,
       "zero_runs": 0,
       "max": 26
     },
     "jobscout24.ch::accounting-assistant": {
-      "last": 18,
+      "last": 20,
       "zero_runs": 0,
       "max": 20
     },
     "jobscout24.ch::accounts-payable": {
-      "last": 10,
+      "last": 9,
       "zero_runs": 0,
       "max": 11
     },
@@ -619,7 +620,7 @@
       "max": 10
     },
     "jobscout24.ch::aide-comptable": {
-      "last": 18,
+      "last": 17,
       "zero_runs": 0,
       "max": 20
     },
@@ -629,12 +630,12 @@
       "max": 10
     },
     "jobscout24.ch::comptabilite": {
-      "last": 23,
+      "last": 24,
       "zero_runs": 0,
       "max": 27
     },
     "jobscout24.ch::comptable": {
-      "last": 21,
+      "last": 22,
       "zero_runs": 0,
       "max": 25
     },
@@ -649,7 +650,7 @@
       "max": 24
     },
     "jobscout24.ch::fiduciaire": {
-      "last": 21,
+      "last": 23,
       "zero_runs": 0,
       "max": 25
     },
@@ -664,7 +665,7 @@
       "max": 22
     },
     "jobscout24.ch::gestionnaire-de-mandats": {
-      "last": 6,
+      "last": 7,
       "zero_runs": 0,
       "max": 8
     },
@@ -674,7 +675,7 @@
       "max": 1
     },
     "jobscout24.ch::payroll": {
-      "last": 22,
+      "last": 24,
       "zero_runs": 0,
       "max": 26
     },
@@ -684,7 +685,7 @@
       "max": 24
     },
     "jobscout24.ch::tax-consultant": {
-      "last": 20,
+      "last": 21,
       "zero_runs": 0,
       "max": 21
     },
@@ -704,7 +705,7 @@
       "max": 28
     },
     "jobup.ch::aide-comptable": {
-      "last": 39,
+      "last": 38,
       "zero_runs": 0,
       "max": 39
     },
@@ -739,7 +740,7 @@
       "max": 43
     },
     "jobup.ch::facturation": {
-      "last": 34,
+      "last": 35,
       "zero_runs": 0,
       "max": 35
     },
@@ -769,7 +770,7 @@
       "max": 43
     },
     "jobup.ch::payroll": {
-      "last": 11,
+      "last": 12,
       "zero_runs": 0,
       "max": 18
     },
@@ -779,19 +780,19 @@
       "max": 43
     },
     "jobup.ch::tax consultant": {
-      "last": 24,
+      "last": 22,
       "zero_runs": 0,
       "max": 26
     }
   },
   "rejections": {
     "counts": {
-      "aucun_signal_metier_dans_titre": 284,
-      "langue_non_prise_en_charge": 25,
-      "lieu_hors_zone_dans_titre": 190,
+      "aucun_signal_metier_dans_titre": 287,
+      "langue_non_prise_en_charge": 31,
+      "lieu_hors_zone_dans_titre": 191,
       "lieu_hors_zone_ou_inconnu": 26,
-      "metier_exclu_dans_titre": 132,
-      "pertinence_insuffisante": 397
+      "metier_exclu_dans_titre": 144,
+      "pertinence_insuffisante": 404
     },
     "by_source": {
       "Le Temps Emploi": {
@@ -803,9 +804,9 @@
         "pertinence_insuffisante": 1
       },
       "careers.cern": {
-        "aucun_signal_metier_dans_titre": 9,
-        "metier_exclu_dans_titre": 1,
-        "pertinence_insuffisante": 35
+        "aucun_signal_metier_dans_titre": 8,
+        "metier_exclu_dans_titre": 2,
+        "pertinence_insuffisante": 36
       },
       "careers.hug.ch": {
         "aucun_signal_metier_dans_titre": 5,
@@ -813,8 +814,8 @@
         "pertinence_insuffisante": 27
       },
       "careers.icrc.org": {
-        "aucun_signal_metier_dans_titre": 3,
-        "pertinence_insuffisante": 1
+        "aucun_signal_metier_dans_titre": 4,
+        "pertinence_insuffisante": 2
       },
       "careers.lombardodier.com": {
         "aucun_signal_metier_dans_titre": 6,
@@ -824,7 +825,7 @@
       },
       "careers.pictet.com": {
         "aucun_signal_metier_dans_titre": 4,
-        "pertinence_insuffisante": 2
+        "pertinence_insuffisante": 3
       },
       "careers.vitol.com": {
         "aucun_signal_metier_dans_titre": 2,
@@ -836,18 +837,19 @@
         "pertinence_insuffisante": 56
       },
       "ecolint.ch": {
+        "metier_exclu_dans_titre": 1,
         "pertinence_insuffisante": 1
       },
       "educh.ch": {
-        "aucun_signal_metier_dans_titre": 11,
+        "aucun_signal_metier_dans_titre": 12,
         "lieu_hors_zone_dans_titre": 8,
-        "metier_exclu_dans_titre": 17,
-        "pertinence_insuffisante": 23
+        "metier_exclu_dans_titre": 20,
+        "pertinence_insuffisante": 25
       },
       "ge.ch": {
         "aucun_signal_metier_dans_titre": 19,
-        "metier_exclu_dans_titre": 18,
-        "pertinence_insuffisante": 30
+        "metier_exclu_dans_titre": 20,
+        "pertinence_insuffisante": 31
       },
       "geneve.ch": {
         "aucun_signal_metier_dans_titre": 6,
@@ -860,10 +862,10 @@
         "pertinence_insuffisante": 1
       },
       "jobs.ch": {
-        "aucun_signal_metier_dans_titre": 70,
+        "aucun_signal_metier_dans_titre": 68,
         "lieu_hors_zone_dans_titre": 10,
-        "metier_exclu_dans_titre": 15,
-        "pertinence_insuffisante": 33
+        "metier_exclu_dans_titre": 19,
+        "pertinence_insuffisante": 34
       },
       "jobs.itu.int": {
         "aucun_signal_metier_dans_titre": 3,
@@ -885,15 +887,15 @@
         "pertinence_insuffisante": 35
       },
       "jobscout24.ch": {
-        "aucun_signal_metier_dans_titre": 13,
-        "langue_non_prise_en_charge": 22,
-        "lieu_hors_zone_dans_titre": 146,
+        "aucun_signal_metier_dans_titre": 15,
+        "langue_non_prise_en_charge": 28,
+        "lieu_hors_zone_dans_titre": 147,
         "metier_exclu_dans_titre": 8,
         "pertinence_insuffisante": 35
       },
       "jobup.ch": {
-        "aucun_signal_metier_dans_titre": 108,
-        "metier_exclu_dans_titre": 20,
+        "aucun_signal_metier_dans_titre": 110,
+        "metier_exclu_dans_titre": 21,
         "pertinence_insuffisante": 35
       },
       "museums.ch": {
